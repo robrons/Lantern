@@ -4,6 +4,10 @@
 (() => {
   'use strict';
 
+  // "Verify you're human" checks look for pages that have been modified; leave them untouched.
+  const VERIFICATION = /(^|\.)(challenges\.cloudflare\.com|hcaptcha\.com|recaptcha\.net|arkoselabs\.com|funcaptcha\.com|perimeterx\.net|px-cdn\.net|px-cloud\.net|captcha-delivery\.com)$/;
+  if (VERIFICATION.test(location.hostname) || (/(^|\.)google\.com$/.test(location.hostname) && location.pathname.startsWith('/recaptcha'))) return;
+
   let fullscreenElement = null;
 
   const define = (proto, name, value) => {

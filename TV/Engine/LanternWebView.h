@@ -20,6 +20,14 @@ NS_SWIFT_UI_ACTOR
 @optional
 /// The page's process stopped (it crashed or ran out of memory). Without this, the page reloads.
 - (void)webViewContentProcessDidTerminate:(LanternWebView *)webView;
+/// A script on the page wants to open a window (a sign-in window, or often an ad). Without
+/// this, such windows are blocked.
+- (BOOL)webView:(LanternWebView *)webView shouldOpenPopupForURL:(NSURL *)url;
+/// A window was opened for the page. It stays connected to the page that opened it, which is
+/// what sign-in windows need to report back.
+- (void)webView:(LanternWebView *)webView didOpenPopup:(LanternWebView *)popup;
+/// The page closed its own window (as sign-in windows do when they're finished).
+- (void)webViewDidClose:(LanternWebView *)webView;
 @end
 
 /// Hosts Safari's web engine, which ships on tvOS but is not part of the public SDK.

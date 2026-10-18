@@ -66,6 +66,14 @@ final class BrowserViewController: UIViewController {
     /// engine's own back list, so Lantern keeps this to still be able to go back.
     private var visitedPages: [URL] = []
     private var fullScreenTipPage: String?
+    private var verificationNoticePage: String?
+
+    // Pop-up windows (sign-ins). While one is open, the pointer and remote work in it.
+    private var popup: LanternWebView?
+    private let popupBackdrop = UIView()
+    private let popupTitle = UILabel()
+    /// The page the remote is working in: an open pop-up, otherwise the main page.
+    private var activeWeb: LanternWebView? { popup ?? web }
 
     // Presses the browser has taken charge of, so their release is handled here too.
     private var ownedPresses = Set<ObjectIdentifier>()
@@ -236,8 +244,17 @@ final class BrowserViewController: UIViewController {
         }
     }
 
-    private func run(_ script: String, completion: ((Any?) -> Void)? = nil) {
-        guard let web else {
+    /// The pointer in the active page's own coordinates, and that page's width.
+    private func pagePoint(_ point: CGPoint) -> CGPoint {
+        guard let page = activeWeb else { return point }
+        return view.convert(point, to: page)
+    }
+
+    private var pageWidth: CGFloat { activeWeb?.bounds.width ?? view.bounds.width }
+
+    /// Runs a script in the page the remote is working in (or `target`, if given).
+    private func run(_ script: String, in target: LanternWebView? = nil, completion: ((Any?) -> Void)? = nil) {
+        guard let web = target ?? activeWeb else {
             completion?(nil)
             return
         }
@@ -304,6 +321,60 @@ final class BrowserViewController: UIViewController {
             visitedPages.append(url)
             if visitedPages.count > 50 { visitedPages.removeFirst() }
         }
+    }
+
+    /// Shows a window a page opened, over the page, until it closes itself or you press Back.
+    private func showPopup(_ newPopup: LanternWebView) {
+        closePopup()
+        hideToolbar()
+        hideTargetOutline()
+        popup = newPopup
+        newPopup.delegate = self
+
+        popupBackdrop.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        popupBackdrop.frame = view.bounds
+        popupBackdrop.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        popupTitle.textColor = .white
+        popupTitle.font = .preferredFont(forTextStyle: .callout)
+        popupTitle.textAlignment = .center
+        popupTitle.frame = CGRect(x: 0, y: 40, width: view.bounds.width, height: 50)
+        popupTitle.autoresizingMask = [.flexibleWidth]
+        popupTitle.text = "Opening a window\u{2026}"
+        popupBackdrop.addSubview(popupTitle)
+
+        newPopup.frame = view.bounds.inset(by: UIEdgeInsets(top: 110, left: 180, bottom: 70, right: 180))
+        newPopup.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        newPopup.layer.cornerRadius = 24
+        newPopup.clipsToBounds = true
+        popupBackdrop.addSubview(newPopup)
+        if let web {
+            view.insertSubview(popupBackdrop, aboveSubview: web)
+        }
+        popupBackdrop.alpha = 0
+        UIView.animate(withDuration: 0.25) { self.popupBackdrop.alpha = 1 }
+        resetPageWork()
+        showPointer()
+    }
+
+    private func closePopup() {
+        guard let closing = popup else { return }
+        popup = nil
+        resetPageWork()
+        hideTargetOutline()
+        scheduleHover(after: 0.3)
+        UIView.animate(withDuration: 0.2, animations: {
+            self.popupBackdrop.alpha = 0
+        }, completion: { _ in
+            closing.removeFromSuperview()
+            if self.popup == nil { self.popupBackdrop.removeFromSuperview() }
+        })
+        showPointer()
+    }
+
+    private func updatePopupTitle() {
+        guard let popup else { return }
+        let host = popup.url?.host ?? ""
+        popupTitle.text = host.isEmpty ? "Window" : "\(host) \u{2014} press Back to close"
     }
 
     /// Forgets work sent to a page that has gone away.
@@ -486,6 +557,10 @@ final class BrowserViewController: UIViewController {
     }
 
     private func goBack() {
+        if let popup {
+            if popup.canGoBack { popup.goBack() } else { closePopup() }
+            return
+        }
         if inTheater {
             run(PageScripts.call("exitTheater"))
             setTheater(false)
@@ -503,7 +578,8 @@ final class BrowserViewController: UIViewController {
         pointer.pulse()
         scheduleHide()
         guard pageIsResponsive() else { return }
-        run(PageScripts.call("click", point.x, point.y, view.bounds.width))
+        let target = pagePoint(point)
+        run(PageScripts.call("click", target.x, target.y, pageWidth))
     }
 
     /// Clicking the top or bottom of the clickpad scrolls about half a screen.
@@ -517,7 +593,8 @@ final class BrowserViewController: UIViewController {
     /// Finds out whether the pointer is over a scrollable box inside the page.
     private func checkScroller(then action: (() -> Void)? = nil) {
         guard pageIsResponsive() else { return }
-        run(PageScripts.call("scroller", pointerPosition.x, pointerPosition.y, view.bounds.width)) { [weak self] result in
+        let target = pagePoint(pointerPosition)
+        run(PageScripts.call("scroller", target.x, target.y, pageWidth)) { [weak self] result in
             self?.scrollsInnerBox = result as? String == "inner"
             action?()
         }
@@ -531,7 +608,7 @@ final class BrowserViewController: UIViewController {
     /// Scrolls the whole page with Apple's own scrolling: smooth, and no round trip to the page.
     /// Returns false when the page itself doesn't scroll (some sites scroll a box instead).
     private func scrollPageNatively(dx: CGFloat, dy: CGFloat, animated: Bool) -> Bool {
-        guard let scrollView = web?.scrollView else { return false }
+        guard let scrollView = activeWeb?.scrollView else { return false }
         let size = scrollView.contentSize
         let bounds = scrollView.bounds.size
         let scrollsVertically = size.height > bounds.height + 1
@@ -559,7 +636,8 @@ final class BrowserViewController: UIViewController {
         let amount = pendingScriptScroll
         pendingScriptScroll = .zero
         scriptScrollInFlight = true
-        run(PageScripts.call("scroll", pointerPosition.x, pointerPosition.y, amount.x, amount.y, view.bounds.width, smooth)) { [weak self] _ in
+        let target = pagePoint(pointerPosition)
+        run(PageScripts.call("scroll", target.x, target.y, amount.x, amount.y, pageWidth, smooth)) { [weak self] _ in
             guard let self else { return }
             self.scriptScrollInFlight = false
             self.scheduleHover(after: smooth ? 0.45 : 0.1)
@@ -682,7 +760,9 @@ final class BrowserViewController: UIViewController {
         guard pageIsResponsive() else { return }
         hoverInFlight = true
         lastHover = CACurrentMediaTime()
-        run(PageScripts.call("hover", pointerPosition.x, pointerPosition.y, view.bounds.width)) { [weak self] result in
+        let target = pagePoint(pointerPosition)
+        let page = activeWeb
+        run(PageScripts.call("hover", target.x, target.y, pageWidth)) { [weak self] result in
             guard let self else { return }
             self.hoverInFlight = false
             if self.hoverAgain {
@@ -693,7 +773,8 @@ final class BrowserViewController: UIViewController {
             self.pointer.style = (info?["kind"] as? String).flatMap(PointerView.Style.init(rawValue:)) ?? .normal
             let rect = (info?["rect"] as? [NSNumber])?.map { CGFloat($0.doubleValue) }
             if let rect, rect.count == 4, self.pointerVisible, !self.toolbarVisible, !self.inTheater {
-                self.showTargetOutline(CGRect(x: rect[0], y: rect[1], width: rect[2], height: rect[3]))
+                let pageRect = CGRect(x: rect[0], y: rect[1], width: rect[2], height: rect[3])
+                self.showTargetOutline(page.map { $0.convert(pageRect, to: self.view) } ?? pageRect)
             } else {
                 self.hideTargetOutline()
             }
@@ -879,6 +960,11 @@ final class BrowserViewController: UIViewController {
             playInNativePlayer(body)
         case "theater":
             setTheater(body["on"] as? Bool == true)
+        case "verification":
+            if let page = currentPageKey, verificationNoticePage != page {
+                verificationNoticePage = page
+                toast.show("Lantern can't click \u{201C}verify you\u{2019}re human\u{201D} checks; they need a real touch. Some pass on their own if you wait a few seconds.", for: 7)
+            }
         case "popupBlocked":
             toast.show("Blocked a pop-up", for: 2)
         case "adBlocked":
@@ -971,6 +1057,10 @@ private extension ToolbarAction {
 
 extension BrowserViewController: LanternWebViewDelegate {
     func webViewStateDidChange(_ webView: LanternWebView) {
+        guard webView === web else {
+            updatePopupTitle()
+            return
+        }
         let loading = webView.isLoading
         progressBar.setProgress(Float(webView.estimatedProgress), animated: true)
         UIView.animate(withDuration: 0.3) {
@@ -995,8 +1085,8 @@ extension BrowserViewController: LanternWebViewDelegate {
     }
 
     func webView(_ webView: LanternWebView, didFinishLoading url: URL?) {
-        guard let url else { return }
-        run(PageScripts.call("info")) { [weak self] result in
+        guard webView === web, let url else { return }
+        run(PageScripts.call("info"), in: webView) { [weak self] result in
             guard let self else { return }
             let icon = ((result as? [String: Any])?["icon"] as? String).flatMap(URL.init(string:))
             self.library.recordVisit(url: url, title: webView.title ?? "", iconURL: icon)
@@ -1010,6 +1100,10 @@ extension BrowserViewController: LanternWebViewDelegate {
     }
 
     func webViewContentProcessDidTerminate(_ webView: LanternWebView) {
+        if webView === popup {
+            closePopup()
+            return
+        }
         resetPageWork()
         // Lantern shut down a frozen page on purpose; carry on with what you asked for.
         if let action = afterFrozenPageStops {
@@ -1026,6 +1120,18 @@ extension BrowserViewController: LanternWebViewDelegate {
             toast.show("This page stopped working, so Lantern reloaded it.", for: 4)
             webView.reload()
         }
+    }
+
+    func webView(_ webView: LanternWebView, shouldOpenPopupFor url: URL) -> Bool {
+        webView === web && popup == nil && PopupPolicy.allows(url, openedFrom: webView.url)
+    }
+
+    func webView(_ webView: LanternWebView, didOpenPopup newPopup: LanternWebView) {
+        showPopup(newPopup)
+    }
+
+    func webViewDidClose(_ webView: LanternWebView) {
+        if webView === popup { closePopup() }
     }
 
     func webView(_ webView: LanternWebView, didFailWithError error: Error) {

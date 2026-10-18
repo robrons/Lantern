@@ -14,7 +14,7 @@ tvOS ships Safari's web engine but doesn't let apps use it. Lantern loads it any
 - **Full-screen video in Apple's player.** Hold Play/Pause (or use a site's own full-screen button) and the video opens in AVKit's player: true full screen, audio in sync, click to pause, swipe to scrub.
 - **Works with embedded players.** Clicks, typing and full screen reach video players inside frames from other sites.
 - **Typing.** Clicking a text field opens the tvOS keyboard, so typing from your iPhone and dictation work as usual.
-- **Pop-up and ad blocking.** Windows opened by scripts are blocked, and requests to common ad and pop-under networks are blocked by WebKit content rules, including redirects that try to jump to an ad page.
+- **Sign-in windows, without ad pop-ups.** "Sign in with Google" and similar windows open over the page and stay connected to it, so sign-ins complete and the window closes itself. Other windows opened by scripts are blocked, and requests to common ad and pop-under networks are blocked by WebKit content rules, including redirects that try to jump to an ad page.
 - **Home screen.** Favorites, recently visited sites with page snapshots, a Continue tile, and full history.
 - **Per-site settings.** Each site remembers its zoom and whether to show the desktop or mobile version. YouTube defaults to mobile, whose video the TV can play.
 - **Stays responsive.** Lantern never queues work onto a slow page. If a page freezes, Back, Home and Reload shut it down and carry on.
@@ -51,6 +51,8 @@ With a free Apple developer account, apps you install yourself stop opening afte
 - `TV/Browser` holds the browser screen, the pointer, the menu and the native player; `TV/Home` holds the home screen.
 
 The web engine on tvOS doesn't include Media Source Extensions, so videos that sites feed to the page in pieces won't play. Videos with a normal or HLS stream address do, which is what most sites send to iPhones.
+
+"Verify you're human" checks that need a click or a press-and-hold can't be completed: they only accept physical touches and mouse presses, and tvOS gives apps no way to pass those to the web engine. Lantern leaves those check frames untouched, so checks that pass on their own still can.
 
 ## Notes
 

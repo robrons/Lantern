@@ -94,12 +94,26 @@ static BOOL LanternLoadEngine(void) {
 
 #pragma mark - Bridge
 
+/// Which LanternWebView hosts each engine view. Pop-up windows share their opener's script
+/// handler, so messages are routed by the engine view they came from.
+static NSMapTable *LanternOwnersByEngine(void) {
+    static NSMapTable *owners;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        owners = [NSMapTable weakToWeakObjectsMapTable];
+    });
+    return owners;
+}
+
 @interface LanternWebView ()
 - (void)bridgeReceivedMessage:(id)body;
 - (void)bridgeDidFinishNavigation;
 - (void)bridgeDidFailWithError:(NSError *)error;
 - (void)bridgeLoadRequest:(NSURLRequest *)request;
 - (void)bridgeContentProcessTerminated;
+- (void)bridgeDidClose;
+- (UIView *)engineView;
+- (instancetype)initPopupWithFrame:(CGRect)frame configuration:(id)configuration opener:(LanternWebView *)opener NS_DESIGNATED_INITIALIZER;
 - (void)bridgeApplySiteModeForURL:(NSURL *)url preferences:(id)preferences;
 @end
 
@@ -125,9 +139,14 @@ static BOOL LanternLoadEngine(void) {
 
 - (void)userContentController:(id)controller didReceiveScriptMessage:(id)message {
     id body = LanternGet(message, @"body");
+    LanternWebView *owner = [LanternOwnersByEngine() objectForKey:LanternGet(message, @"webView")] ?: self.owner;
     if (body != nil) {
-        [self.owner bridgeReceivedMessage:body];
+        [owner bridgeReceivedMessage:body];
     }
+}
+
+- (void)webViewDidClose:(id)webView {
+    [self.owner bridgeDidClose];
 }
 
 - (void)webView:(id)webView didFinishNavigation:(id)navigation {
@@ -178,18 +197,28 @@ static BOOL LanternLoadEngine(void) {
     if (request.URL == nil || request.URL.absoluteString.length == 0) {
         return nil;
     }
-    // A link opening in a new tab opens here instead. Windows opened by scripts are almost
-    // always ads, and because remote clicks are synthesized the engine can't tell them
-    // apart from ones you asked for, so those are blocked.
+    // A link opening in a new tab opens here instead.
     SEL typeSelector = NSSelectorFromString(@"navigationType");
     NSInteger type = [navigationAction respondsToSelector:typeSelector]
         ? ((NSInteger (*)(id, SEL))objc_msgSend)(navigationAction, typeSelector)
         : -1;
+    LanternWebView *owner = self.owner;
     if (type == 0) {
-        [self.owner bridgeLoadRequest:request];
-    } else {
-        [self.owner bridgeReceivedMessage:@{@"type": @"popupBlocked", @"url": request.URL.absoluteString}];
+        [owner bridgeLoadRequest:request];
+        return nil;
     }
+    // Windows opened by scripts are usually ads, but sign-in windows are opened this way too,
+    // and they need a real window that stays connected to the page. The delegate decides.
+    id<LanternWebViewDelegate> delegate = owner.delegate;
+    if (owner != nil && [delegate respondsToSelector:@selector(webView:shouldOpenPopupForURL:)]
+        && [delegate webView:owner shouldOpenPopupForURL:request.URL]) {
+        LanternWebView *popup = [[LanternWebView alloc] initPopupWithFrame:owner.bounds configuration:configuration opener:owner];
+        if ([delegate respondsToSelector:@selector(webView:didOpenPopup:)]) {
+            [delegate webView:owner didOpenPopup:popup];
+        }
+        return [popup engineView];
+    }
+    [owner bridgeReceivedMessage:@{@"type": @"popupBlocked", @"url": request.URL.absoluteString}];
     return nil;
 }
 
@@ -334,6 +363,30 @@ static BOOL LanternLoadEngine(void) {
         NSSelectorFromString(@"addScriptMessageHandler:contentWorld:name:"),
         _bridge, _scriptWorld, LanternMessageHandlerName);
 
+    [self attachEngineWithConfiguration:configuration];
+    return self;
+}
+
+/// A window a page opened. It shares the opener's scripts, blocking rules and settings, and
+/// uses the configuration the engine supplied so the two pages stay connected.
+- (instancetype)initPopupWithFrame:(CGRect)frame configuration:(id)configuration opener:(LanternWebView *)opener {
+    self = [super initWithFrame:frame];
+    if (self == nil) {
+        return nil;
+    }
+    self.backgroundColor = UIColor.blackColor;
+    _bridge = [LanternWebViewBridge new];
+    _bridge.owner = self;
+    _scriptWorld = opener->_scriptWorld;
+    _userContent = opener->_userContent;
+    self.desktopUserAgent = opener.desktopUserAgent;
+    self.mobileUserAgent = opener.mobileUserAgent;
+    self.prefersMobileSite = opener.prefersMobileSite;
+    [self attachEngineWithConfiguration:configuration];
+    return self;
+}
+
+- (void)attachEngineWithConfiguration:(id)configuration {
     UIView *engine = ((id (*)(id, SEL, CGRect, id))objc_msgSend)(
         [NSClassFromString(@"WKWebView") alloc],
         NSSelectorFromString(@"initWithFrame:configuration:"),
@@ -352,11 +405,15 @@ static BOOL LanternLoadEngine(void) {
 
     [self addSubview:engine];
     _engine = engine;
+    [LanternOwnersByEngine() setObject:self forKey:engine];
 
     for (NSString *key in [LanternWebView observedKeys]) {
         [engine addObserver:self forKeyPath:key options:0 context:LanternKVOContext];
     }
-    return self;
+}
+
+- (UIView *)engineView {
+    return _engine;
 }
 
 - (void)dealloc {
@@ -576,6 +633,12 @@ static BOOL LanternLoadEngine(void) {
         return;
     }
     LanternSetObject(_engine, @"loadRequest:", request);
+}
+
+- (void)bridgeDidClose {
+    if ([self.delegate respondsToSelector:@selector(webViewDidClose:)]) {
+        [self.delegate webViewDidClose:self];
+    }
 }
 
 - (void)bridgeContentProcessTerminated {

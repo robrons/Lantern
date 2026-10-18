@@ -8,6 +8,12 @@
   const TOKEN = '__LANTERN_TOKEN__';
   const isTop = window === window.top;
 
+  // "Verify you're human" checks only accept real touches, and treat scripted events as signs
+  // of automation. Lantern sends nothing into them, so they can run undisturbed.
+  const VERIFICATION = /(^|\.)(challenges\.cloudflare\.com|hcaptcha\.com|recaptcha\.net|arkoselabs\.com|funcaptcha\.com|perimeterx\.net|px-cdn\.net|px-cloud\.net|captcha-delivery\.com)$/;
+  const isVerificationFrame = !isTop && (VERIFICATION.test(location.hostname)
+    || (/(^|\.)google\.com$/.test(location.hostname) && location.pathname.startsWith('/recaptcha')));
+
   const post = (message) => {
     try { window.webkit.messageHandlers.lantern.postMessage(message); } catch (e) {}
   };
@@ -659,6 +665,10 @@
     event.stopImmediatePropagation();
 
     if (!isTop && event.source === window.parent) {
+      if (isVerificationFrame) {
+        if (data.t === 'click') post({ type: 'verification' });
+        return;
+      }
       switch (data.t) {
         case 'click': clickAt(data.x, data.y); break;
         case 'hover': hoverAt(data.x, data.y); break;
