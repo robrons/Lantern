@@ -1,0 +1,602 @@
+#import "LanternWebView.h"
+
+#import <dlfcn.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
+
+static NSString * const LanternMessageHandlerName = @"lantern";
+static void *LanternKVOContext = &LanternKVOContext;
+
+#pragma mark - Runtime helpers
+
+static id LanternGet(id object, NSString *selectorName) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (object == nil || ![object respondsToSelector:selector]) {
+        return nil;
+    }
+    return ((id (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static BOOL LanternGetBool(id object, NSString *selectorName) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (object == nil || ![object respondsToSelector:selector]) {
+        return NO;
+    }
+    return ((BOOL (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static void LanternSetBool(id object, NSString *selectorName, BOOL value) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (object != nil && [object respondsToSelector:selector]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(object, selector, value);
+    }
+}
+
+static void LanternSetInteger(id object, NSString *selectorName, NSInteger value) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (object != nil && [object respondsToSelector:selector]) {
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(object, selector, value);
+    }
+}
+
+static void LanternSetObject(id object, NSString *selectorName, id value) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (object != nil && [object respondsToSelector:selector]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(object, selector, value);
+    }
+}
+
+#pragma mark - Engine loading
+
+static NSInteger LanternUnknownPrivacyStance(__unused id self, __unused SEL _cmd) {
+    return 0;
+}
+
+/// The tvOS build of WebKit's network metrics class lacks a method its media loader calls,
+/// which crashes video playback. Answer "unknown" instead.
+static void LanternInstallEngineFixes(void) {
+    Class metricsClass = NSClassFromString(@"WebCoreNSURLSessionTaskTransactionMetrics");
+    if (metricsClass == Nil) {
+        return;
+    }
+    for (NSString *name in @[@"privacyStance", @"_privacyStance"]) {
+        SEL selector = NSSelectorFromString(name);
+        if (class_getInstanceMethod(metricsClass, selector) == NULL) {
+            class_addMethod(metricsClass, selector, (IMP)LanternUnknownPrivacyStance, "q@:");
+        }
+    }
+}
+
+static BOOL LanternLoadEngine(void) {
+    static BOOL available = NO;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        if (NSClassFromString(@"WKWebView") == Nil) {
+            NSArray<NSString *> *paths = @[
+                @"/System/Library/Frameworks/WebKit.framework/WebKit",
+                @"/System/Library/PrivateFrameworks/WebKit.framework/WebKit",
+            ];
+            for (NSString *path in paths) {
+                if (dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL) != NULL
+                    && NSClassFromString(@"WKWebView") != Nil) {
+                    break;
+                }
+            }
+        }
+        available = NSClassFromString(@"WKWebView") != Nil
+            && NSClassFromString(@"WKContentWorld") != Nil;
+        if (available) {
+            LanternInstallEngineFixes();
+        }
+    });
+    return available;
+}
+
+#pragma mark - Bridge
+
+@interface LanternWebView ()
+- (void)bridgeReceivedMessage:(id)body;
+- (void)bridgeDidFinishNavigation;
+- (void)bridgeDidFailWithError:(NSError *)error;
+- (void)bridgeLoadRequest:(NSURLRequest *)request;
+- (void)bridgeContentProcessTerminated;
+- (void)bridgeApplySiteModeForURL:(NSURL *)url preferences:(id)preferences;
+@end
+
+/// Receives the engine's delegate callbacks. It holds the view weakly because the engine
+/// keeps its message handler alive for as long as the engine exists.
+@interface LanternWebViewBridge : NSObject
+@property (nonatomic, weak) LanternWebView *owner;
+@end
+
+@implementation LanternWebViewBridge
+
++ (void)adoptEngineProtocols {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        for (NSString *name in @[@"WKScriptMessageHandler", @"WKNavigationDelegate", @"WKUIDelegate"]) {
+            Protocol *protocol = objc_getProtocol(name.UTF8String);
+            if (protocol != NULL) {
+                class_addProtocol(self, protocol);
+            }
+        }
+    });
+}
+
+- (void)userContentController:(id)controller didReceiveScriptMessage:(id)message {
+    id body = LanternGet(message, @"body");
+    if (body != nil) {
+        [self.owner bridgeReceivedMessage:body];
+    }
+}
+
+- (void)webView:(id)webView didFinishNavigation:(id)navigation {
+    [self.owner bridgeDidFinishNavigation];
+}
+
+- (void)webView:(id)webView didFailNavigation:(id)navigation withError:(NSError *)error {
+    [self.owner bridgeDidFailWithError:error];
+}
+
+- (void)webView:(id)webView didFailProvisionalNavigation:(id)navigation withError:(NSError *)error {
+    [self.owner bridgeDidFailWithError:error];
+}
+
+- (void)webViewWebContentProcessDidTerminate:(id)webView {
+    [self.owner bridgeContentProcessTerminated];
+}
+
+- (void)webView:(id)webView
+    decidePolicyForNavigationAction:(id)navigationAction
+                        preferences:(id)preferences
+                    decisionHandler:(void (^)(NSInteger policy, id preferences))decisionHandler {
+    NSURLRequest *request = LanternGet(navigationAction, @"request");
+    NSString *scheme = request.URL.scheme.lowercaseString ?: @"";
+    NSArray<NSString *> *webSchemes = @[@"http", @"https", @"about", @"data", @"blob"];
+    if (![webSchemes containsObject:scheme]) {
+        decisionHandler(0, preferences);
+        return;
+    }
+    // Links that ask for a new window open in place: Lantern has one page at a time.
+    id targetFrame = LanternGet(navigationAction, @"targetFrame");
+    if (targetFrame == nil) {
+        decisionHandler(0, preferences);
+        [self.owner bridgeLoadRequest:request];
+        return;
+    }
+    if (LanternGetBool(targetFrame, @"isMainFrame")) {
+        [self.owner bridgeApplySiteModeForURL:request.URL preferences:preferences];
+    }
+    decisionHandler(1, preferences);
+}
+
+- (id)webView:(id)webView
+    createWebViewWithConfiguration:(id)configuration
+               forNavigationAction:(id)navigationAction
+                    windowFeatures:(id)windowFeatures {
+    NSURLRequest *request = LanternGet(navigationAction, @"request");
+    if (request.URL == nil || request.URL.absoluteString.length == 0) {
+        return nil;
+    }
+    // A link opening in a new tab opens here instead. Windows opened by scripts are almost
+    // always ads, and because remote clicks are synthesized the engine can't tell them
+    // apart from ones you asked for, so those are blocked.
+    SEL typeSelector = NSSelectorFromString(@"navigationType");
+    NSInteger type = [navigationAction respondsToSelector:typeSelector]
+        ? ((NSInteger (*)(id, SEL))objc_msgSend)(navigationAction, typeSelector)
+        : -1;
+    if (type == 0) {
+        [self.owner bridgeLoadRequest:request];
+    } else {
+        [self.owner bridgeReceivedMessage:@{@"type": @"popupBlocked", @"url": request.URL.absoluteString}];
+    }
+    return nil;
+}
+
+- (void)webView:(id)webView
+    runJavaScriptAlertPanelWithMessage:(NSString *)message
+                      initiatedByFrame:(id)frame
+                     completionHandler:(void (^)(void))completionHandler {
+    LanternWebView *owner = self.owner;
+    if (owner == nil || owner.delegate == nil) {
+        completionHandler();
+        return;
+    }
+    [owner.delegate webView:owner showAlert:message confirm:NO completion:^(__unused BOOL accepted) {
+        completionHandler();
+    }];
+}
+
+- (void)webView:(id)webView
+    runJavaScriptConfirmPanelWithMessage:(NSString *)message
+                        initiatedByFrame:(id)frame
+                       completionHandler:(void (^)(BOOL result))completionHandler {
+    LanternWebView *owner = self.owner;
+    if (owner == nil || owner.delegate == nil) {
+        completionHandler(NO);
+        return;
+    }
+    [owner.delegate webView:owner showAlert:message confirm:YES completion:^(BOOL accepted) {
+        completionHandler(accepted);
+    }];
+}
+
+@end
+
+#pragma mark - LanternWebView
+
+@implementation LanternWebView {
+    UIView *_engine;
+    LanternWebViewBridge *_bridge;
+    id _scriptWorld;
+    id _userContent;
+    BOOL _rulesPending;
+    NSURLRequest *_pendingRequest;
+}
+
++ (NSArray<NSString *> *)observedKeys {
+    return @[@"title", @"URL", @"loading", @"estimatedProgress", @"canGoBack", @"canGoForward"];
+}
+
++ (BOOL)isEngineAvailable {
+    return LanternLoadEngine();
+}
+
++ (NSString *)engineDiagnostics {
+    if (!LanternLoadEngine()) {
+        return @"engine unavailable";
+    }
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    id preferences = [NSClassFromString(@"WKPreferences") new];
+    for (NSString *name in @[@"_setMediaSourceEnabled:", @"_setManagedMediaSourceEnabled:", @"_setEnabled:forFeature:", @"_setBoolValue:forKey:"]) {
+        [lines addObject:[NSString stringWithFormat:@"%@ %@", name, [preferences respondsToSelector:NSSelectorFromString(name)] ? @"yes" : @"no"]];
+    }
+    id features = LanternGet(NSClassFromString(@"WKPreferences"), @"_features");
+    for (id feature in features) {
+        NSString *key = LanternGet(feature, @"key");
+        if ([key.lowercaseString containsString:@"media"] || [key.lowercaseString containsString:@"source"]) {
+            BOOL enabled = NO;
+            SEL isEnabled = NSSelectorFromString(@"_isEnabledForFeature:");
+            if ([preferences respondsToSelector:isEnabled]) {
+                enabled = ((BOOL (*)(id, SEL, id))objc_msgSend)(preferences, isEnabled, feature);
+            }
+            [lines addObject:[NSString stringWithFormat:@"feature %@ = %d", key, enabled]];
+        }
+    }
+    return [lines componentsJoinedByString:@"\n"];
+}
+
+- (instancetype)initWithFrame:(CGRect)frame isolatedScript:(NSString *)isolatedScript pageScript:(NSString *)pageScript {
+    self = [super initWithFrame:frame];
+    if (self == nil) {
+        return nil;
+    }
+    self.backgroundColor = UIColor.blackColor;
+    if (!LanternLoadEngine()) {
+        return self;
+    }
+
+    [LanternWebViewBridge adoptEngineProtocols];
+    _bridge = [LanternWebViewBridge new];
+    _bridge.owner = self;
+
+    id configuration = [NSClassFromString(@"WKWebViewConfiguration") new];
+    LanternSetBool(configuration, @"setAllowsInlineMediaPlayback:", YES);
+    // Clicks from the remote are synthesized in JavaScript and never count as a user
+    // gesture, so let pages start playback without one.
+    LanternSetInteger(configuration, @"setMediaTypesRequiringUserActionForPlayback:", 0);
+    LanternSetBool(configuration, @"setAllowsPictureInPictureMediaPlayback:", NO);
+
+    id preferences = LanternGet(configuration, @"preferences");
+    LanternSetBool(preferences, @"setJavaScriptCanOpenWindowsAutomatically:", YES);
+    // Streaming sites need Media Source Extensions, which tvOS leaves switched off.
+    for (NSString *name in @[@"_setMediaSourceEnabled:",
+                             @"_setManagedMediaSourceEnabled:",
+                             @"_setMediaCapabilityGrantsEnabled:",
+                             @"_setVideoQualityIncludesDisplayCompositingEnabled:"]) {
+        LanternSetBool(preferences, name, YES);
+    }
+    // The setters above don't stick on tvOS; switching the features on by name does.
+    NSSet<NSString *> *wantedFeatures = [NSSet setWithArray:@[@"MediaSourceEnabled",
+                                                             @"ManagedMediaSourceEnabled",
+                                                             @"MediaSourceInWorkerEnabled"]];
+    SEL setFeature = NSSelectorFromString(@"_setEnabled:forFeature:");
+    if ([preferences respondsToSelector:setFeature]) {
+        for (id feature in LanternGet(NSClassFromString(@"WKPreferences"), @"_features")) {
+            if ([wantedFeatures containsObject:LanternGet(feature, @"key")]) {
+                ((void (*)(id, SEL, BOOL, id))objc_msgSend)(preferences, setFeature, YES, feature);
+            }
+        }
+    }
+
+    // Ask sites for their desktop layout; the TV screen is wide, and page zoom keeps text readable.
+    id webpagePreferences = LanternGet(configuration, @"defaultWebpagePreferences");
+    LanternSetInteger(webpagePreferences, @"setPreferredContentMode:", 2);
+
+    Class worldClass = NSClassFromString(@"WKContentWorld");
+    _scriptWorld = ((id (*)(id, SEL, id))objc_msgSend)(worldClass, NSSelectorFromString(@"worldWithName:"), @"lantern");
+
+    id userContent = LanternGet(configuration, @"userContentController");
+    _userContent = userContent;
+    Class scriptClass = NSClassFromString(@"WKUserScript");
+    id isolated = ((id (*)(id, SEL, id, NSInteger, BOOL, id))objc_msgSend)(
+        [scriptClass alloc],
+        NSSelectorFromString(@"initWithSource:injectionTime:forMainFrameOnly:inContentWorld:"),
+        isolatedScript, 0, NO, _scriptWorld);
+    id page = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(
+        [scriptClass alloc],
+        NSSelectorFromString(@"initWithSource:injectionTime:forMainFrameOnly:"),
+        pageScript, 0, NO);
+    LanternSetObject(userContent, @"addUserScript:", page);
+    LanternSetObject(userContent, @"addUserScript:", isolated);
+    ((void (*)(id, SEL, id, id, id))objc_msgSend)(
+        userContent,
+        NSSelectorFromString(@"addScriptMessageHandler:contentWorld:name:"),
+        _bridge, _scriptWorld, LanternMessageHandlerName);
+
+    UIView *engine = ((id (*)(id, SEL, CGRect, id))objc_msgSend)(
+        [NSClassFromString(@"WKWebView") alloc],
+        NSSelectorFromString(@"initWithFrame:configuration:"),
+        self.bounds, configuration);
+    engine.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    // The remote never touches the page directly. Lantern drives it with scripts, which also
+    // keeps the page from taking focus away from Lantern's own controls.
+    engine.userInteractionEnabled = NO;
+    engine.backgroundColor = UIColor.blackColor;
+    LanternSetObject(engine, @"setNavigationDelegate:", _bridge);
+    LanternSetObject(engine, @"setUIDelegate:", _bridge);
+    LanternSetBool(engine, @"setInspectable:", YES);
+
+    UIScrollView *scrollView = LanternGet(engine, @"scrollView");
+    scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+
+    [self addSubview:engine];
+    _engine = engine;
+
+    for (NSString *key in [LanternWebView observedKeys]) {
+        [engine addObserver:self forKeyPath:key options:0 context:LanternKVOContext];
+    }
+    return self;
+}
+
+- (void)dealloc {
+    if (_engine == nil) {
+        return;
+    }
+    for (NSString *key in [LanternWebView observedKeys]) {
+        [_engine removeObserver:self forKeyPath:key context:LanternKVOContext];
+    }
+    LanternSetObject(_engine, @"setNavigationDelegate:", nil);
+    LanternSetObject(_engine, @"setUIDelegate:", nil);
+    id configuration = LanternGet(_engine, @"configuration");
+    id userContent = LanternGet(configuration, @"userContentController");
+    if ([userContent respondsToSelector:NSSelectorFromString(@"removeAllScriptMessageHandlers")]) {
+        ((void (*)(id, SEL))objc_msgSend)(userContent, NSSelectorFromString(@"removeAllScriptMessageHandlers"));
+    }
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath
+                      ofObject:(id)object
+                        change:(NSDictionary<NSKeyValueChangeKey, id> *)change
+                       context:(void *)context {
+    if (context != LanternKVOContext) {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+        return;
+    }
+    [self.delegate webViewStateDidChange:self];
+}
+
+#pragma mark State
+
+- (NSURL *)URL {
+    return LanternGet(_engine, @"URL");
+}
+
+- (NSString *)title {
+    return LanternGet(_engine, @"title");
+}
+
+- (BOOL)isLoading {
+    return LanternGetBool(_engine, @"isLoading");
+}
+
+- (double)estimatedProgress {
+    SEL selector = NSSelectorFromString(@"estimatedProgress");
+    if (![_engine respondsToSelector:selector]) {
+        return 0;
+    }
+    return ((double (*)(id, SEL))objc_msgSend)(_engine, selector);
+}
+
+- (BOOL)canGoBack {
+    return LanternGetBool(_engine, @"canGoBack");
+}
+
+- (BOOL)canGoForward {
+    return LanternGetBool(_engine, @"canGoForward");
+}
+
+- (CGFloat)pageZoom {
+    SEL selector = NSSelectorFromString(@"pageZoom");
+    if (![_engine respondsToSelector:selector]) {
+        return 1;
+    }
+    return ((CGFloat (*)(id, SEL))objc_msgSend)(_engine, selector);
+}
+
+- (void)setPageZoom:(CGFloat)pageZoom {
+    SEL selector = NSSelectorFromString(@"setPageZoom:");
+    if ([_engine respondsToSelector:selector]) {
+        ((void (*)(id, SEL, CGFloat))objc_msgSend)(_engine, selector, pageZoom);
+    }
+}
+
+
+#pragma mark Navigation
+
+- (void)installContentRules:(NSString *)encodedRules {
+    id store = LanternGet(NSClassFromString(@"WKContentRuleListStore"), @"defaultStore");
+    SEL compile = NSSelectorFromString(@"compileContentRuleListForIdentifier:encodedContentRuleList:completionHandler:");
+    if (store == nil || ![store respondsToSelector:compile] || _userContent == nil) {
+        return;
+    }
+    _rulesPending = YES;
+    __weak LanternWebView *weakSelf = self;
+    void (^handler)(id, NSError *) = ^(id list, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf finishInstallingRules:list error:error];
+        });
+    };
+    ((void (*)(id, SEL, id, id, id))objc_msgSend)(store, compile, @"LanternBlockedDomains", encodedRules, handler);
+    // Don't hold pages back for long if compiling stalls.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        [weakSelf finishInstallingRules:nil error:nil];
+    });
+}
+
+- (void)finishInstallingRules:(id)list error:(NSError *)error {
+    if (list != nil) {
+        LanternSetObject(_userContent, @"addContentRuleList:", list);
+    }
+    if (error != nil) {
+        NSLog(@"Lantern: blocking rules failed to compile: %@", error);
+    }
+    if (!_rulesPending) {
+        return;
+    }
+    _rulesPending = NO;
+    if (_pendingRequest != nil) {
+        NSURLRequest *request = _pendingRequest;
+        _pendingRequest = nil;
+        [self bridgeLoadRequest:request];
+    }
+}
+
+- (void)stopFrozenPage {
+    for (NSString *name in @[@"_killWebContentProcess", @"_killWebContentProcessAndResetState"]) {
+        SEL selector = NSSelectorFromString(name);
+        if ([_engine respondsToSelector:selector]) {
+            ((void (*)(id, SEL))objc_msgSend)(_engine, selector);
+            return;
+        }
+    }
+}
+
+- (void)loadURL:(NSURL *)url {
+    [self bridgeLoadRequest:[NSURLRequest requestWithURL:url]];
+}
+
+- (void)goBack {
+    (void)LanternGet(_engine, @"goBack");
+}
+
+- (void)goForward {
+    (void)LanternGet(_engine, @"goForward");
+}
+
+- (void)reload {
+    (void)LanternGet(_engine, @"reload");
+}
+
+- (void)stopLoading {
+    (void)LanternGet(_engine, @"stopLoading");
+}
+
+- (void)evaluateJavaScript:(NSString *)script completion:(void (^)(id, NSError *))completion {
+    SEL selector = NSSelectorFromString(@"evaluateJavaScript:inFrame:inContentWorld:completionHandler:");
+    if (![_engine respondsToSelector:selector]) {
+        if (completion != nil) {
+            completion(nil, nil);
+        }
+        return;
+    }
+    void (^handler)(id, NSError *) = ^(id result, NSError *error) {
+        if (completion != nil) {
+            completion(result, error);
+        }
+    };
+    ((void (*)(id, SEL, id, id, id, id))objc_msgSend)(_engine, selector, script, nil, _scriptWorld, handler);
+}
+
+- (void)fetchCookies:(void (^)(NSArray<NSHTTPCookie *> *))completion {
+    id configuration = LanternGet(_engine, @"configuration");
+    id store = LanternGet(LanternGet(configuration, @"websiteDataStore"), @"httpCookieStore");
+    SEL selector = NSSelectorFromString(@"getAllCookies:");
+    if (store == nil || ![store respondsToSelector:selector]) {
+        completion(@[]);
+        return;
+    }
+    void (^handler)(NSArray *) = ^(NSArray *cookies) {
+        completion(cookies ?: @[]);
+    };
+    ((void (*)(id, SEL, id))objc_msgSend)(store, selector, handler);
+}
+
+- (void)takeSnapshotWithWidth:(CGFloat)width completion:(void (^)(UIImage *))completion {
+    SEL selector = NSSelectorFromString(@"takeSnapshotWithConfiguration:completionHandler:");
+    if (![_engine respondsToSelector:selector]) {
+        completion(nil);
+        return;
+    }
+    id configuration = [NSClassFromString(@"WKSnapshotConfiguration") new];
+    LanternSetObject(configuration, @"setSnapshotWidth:", @(width));
+    void (^handler)(UIImage *, NSError *) = ^(UIImage *image, __unused NSError *error) {
+        completion(image);
+    };
+    ((void (*)(id, SEL, id, id))objc_msgSend)(_engine, selector, configuration, handler);
+}
+
+#pragma mark Bridge callbacks
+
+- (void)bridgeReceivedMessage:(id)body {
+    [self.delegate webView:self didReceiveMessage:body];
+}
+
+- (void)bridgeDidFinishNavigation {
+    [self.delegate webView:self didFinishLoading:self.URL];
+}
+
+- (void)bridgeDidFailWithError:(NSError *)error {
+    // Cancelled loads and loads replaced by a new navigation are not failures.
+    BOOL cancelled = [error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled;
+    BOOL interrupted = [error.domain isEqualToString:@"WebKitErrorDomain"] && error.code == 102;
+    // A page trying to send you to a blocked ad network stays where it was.
+    if ([error.domain isEqualToString:@"WebKitErrorDomain"] && error.code == 104) {
+        [self bridgeReceivedMessage:@{@"type": @"adBlocked"}];
+        return;
+    }
+    if (!cancelled && !interrupted) {
+        [self.delegate webView:self didFailWithError:error];
+    }
+}
+
+- (void)bridgeLoadRequest:(NSURLRequest *)request {
+    if (_rulesPending) {
+        _pendingRequest = request;
+        return;
+    }
+    LanternSetObject(_engine, @"loadRequest:", request);
+}
+
+- (void)bridgeContentProcessTerminated {
+    if ([self.delegate respondsToSelector:@selector(webViewContentProcessDidTerminate:)]) {
+        [self.delegate webViewContentProcessDidTerminate:self];
+    } else {
+        [self reload];
+    }
+}
+
+- (UIScrollView *)scrollView {
+    return LanternGet(_engine, @"scrollView");
+}
+
+- (void)bridgeApplySiteModeForURL:(NSURL *)url preferences:(id)preferences {
+    BOOL mobile = url != nil && self.prefersMobileSite != nil && self.prefersMobileSite(url);
+    NSString *agent = mobile ? self.mobileUserAgent : self.desktopUserAgent;
+    // 1 and 2 are WKContentModeMobile and WKContentModeDesktop.
+    LanternSetInteger(preferences, @"setPreferredContentMode:", mobile ? 1 : 2);
+    LanternSetObject(preferences, @"_setCustomUserAgent:", agent);
+    LanternSetObject(_engine, @"setCustomUserAgent:", agent);
+}
+
+@end
