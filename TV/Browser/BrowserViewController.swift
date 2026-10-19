@@ -8,9 +8,20 @@ final class BrowserViewController: UIViewController {
     var onClose: (() -> Void)?
     /// The page now open, for the home screen's Continue tile.
     var onPageChange: ((Site?) -> Void)?
+    /// The open tabs and which one is on screen, for the home screen.
+    var onTabsChange: (([Site], Int) -> Void)?
 
     private let library: Library
-    private var web: LanternWebView?
+    /// Open tabs, at most three. The one on screen has its page loaded; the others are paused
+    /// and then unloaded to save memory, and reload where you left off when you return.
+    private var tabs: [BrowserTab] = []
+    private var currentTabIndex = 0
+    static let maxTabs = 3
+    /// Set by New Tab: the next page you open from the home screen gets a tab of its own.
+    private var openNextInNewTab = false
+    private var currentTab: BrowserTab? { tabs.indices.contains(currentTabIndex) ? tabs[currentTabIndex] : nil }
+    /// The page on screen.
+    private var web: LanternWebView? { currentTab?.web }
     private let canvas = CanvasView()
     private let pointer = PointerView()
     private let progressBar = UIProgressView(progressViewStyle: .default)
@@ -64,7 +75,10 @@ final class BrowserViewController: UIViewController {
     private var afterFrozenPageStops: (() -> Void)?
     /// Pages visited in this session, newest last. Shutting down a frozen page also clears the
     /// engine's own back list, so Lantern keeps this to still be able to go back.
-    private var visitedPages: [URL] = []
+    private var visitedPages: [URL] {
+        get { currentTab?.visitedPages ?? [] }
+        set { currentTab?.visitedPages = newValue }
+    }
     private var fullScreenTipPage: String?
     private var verificationNoticePage: String?
 
@@ -91,7 +105,11 @@ final class BrowserViewController: UIViewController {
         }
         set { UserDefaults.standard.set(Double(newValue), forKey: Self.pointerSpeedKey) }
     }
-    /// The current page's zoom; each site remembers its own.
+    /// What "100%" means underneath. Pages lay out to the TV's full width, where text is as
+    /// small as on a computer screen; 1.5x makes 100% comfortable from the couch.
+    static let baseZoom: CGFloat = 1.5
+
+    /// The current page's zoom as shown in the menu; each site remembers its own.
     private var zoom: CGFloat {
         web?.url.map(library.zoom(for:)) ?? 1
     }
@@ -125,15 +143,10 @@ final class BrowserViewController: UIViewController {
             return
         }
 
-        let web = LanternWebView(frame: view.bounds, isolatedScript: PageScripts.isolated, pageScript: PageScripts.page)
-        web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        web.delegate = self
-        web.desktopUserAgent = UserAgent.desktopSafari
-        web.mobileUserAgent = UserAgent.iPhoneSafari
-        web.prefersMobileSite = { [weak self] url in self?.library.prefersMobileSite(url) ?? false }
-        web.installContentRules(ContentRules.blockedDomains)
-        view.addSubview(web)
-        self.web = web
+        NotificationCenter.default.addObserver(self, selector: #selector(memoryIsLow),
+                                               name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(leftLantern),
+                                               name: UIApplication.didEnterBackgroundNotification, object: nil)
 
         progressBar.trackTintColor = .clear
         progressBar.progressTintColor = .systemBlue
@@ -215,13 +228,172 @@ final class BrowserViewController: UIViewController {
     // MARK: Pages
 
     func load(_ url: URL) {
-        guard let web else {
+        guard isViewLoaded, LanternWebView.isEngineAvailable() else {
             pendingURL = url
             return
         }
         hideToolbar()
         if inTheater { setTheater(false) }
-        web.loadURL(url)
+        if tabs.isEmpty || (openNextInNewTab && tabs.count < Self.maxTabs) {
+            openNextInNewTab = false
+            tabs.append(BrowserTab())
+            switchToTab(at: tabs.count - 1, loading: url)
+            return
+        }
+        openNextInNewTab = false
+        guard let tab = currentTab else { return }
+        loadedPage(for: tab).loadURL(url)
+    }
+
+    /// Returns to the tab you were on (the home screen's Continue tile).
+    func resumeCurrentTab() {
+        openNextInNewTab = false
+        if let tab = currentTab, tab.web == nil { switchToTab(at: currentTabIndex) }
+    }
+
+    /// Opens one of the tabs from the home screen.
+    func resumeTab(at index: Int) {
+        openNextInNewTab = false
+        switchToTab(at: index)
+    }
+
+    private func makePage() -> LanternWebView {
+        let web = LanternWebView(frame: view.bounds, isolatedScript: PageScripts.isolated, pageScript: PageScripts.page)
+        web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        web.delegate = self
+        web.desktopUserAgent = UserAgent.desktopSafari
+        web.mobileUserAgent = UserAgent.iPhoneSafari
+        web.prefersMobileSite = { [weak self] url in self?.library.prefersMobileSite(url) ?? false }
+        web.layoutZoom = Self.baseZoom
+        web.installContentRules(ContentRules.blockedDomains)
+        return web
+    }
+
+    /// The tab's page, creating it if the tab was unloaded.
+    private func loadedPage(for tab: BrowserTab) -> LanternWebView {
+        if let web = tab.web { return web }
+        let web = makePage()
+        tab.web = web
+        view.insertSubview(web, at: 0)
+        return web
+    }
+
+    private func switchToTab(at index: Int, loading url: URL? = nil) {
+        guard tabs.indices.contains(index) else { return }
+        closePopup()
+        if index != currentTabIndex, let leaving = currentTab {
+            sendToBackground(leaving)
+        }
+        currentTabIndex = index
+        let tab = tabs[index]
+        tab.unloadWork?.cancel()
+        let wasUnloaded = tab.web == nil
+        let page = loadedPage(for: tab)
+        page.isHidden = false
+        if let url {
+            page.loadURL(url)
+        } else if wasUnloaded, let saved = tab.url {
+            tab.restoreScrollOnLoad = true
+            page.loadURL(saved)
+        }
+        for other in tabs where other !== tab { other.web?.isHidden = true }
+
+        // Start fresh for the page now on screen.
+        currentPageKey = nil
+        resetPageWork()
+        mediaSeen = false
+        if inTheater { setTheater(false) }
+        webViewStateDidChange(page)
+        publishTabs()
+        showPointer()
+    }
+
+    /// Pauses a tab you've left and unloads it after 20 seconds, freeing its memory.
+    private func sendToBackground(_ tab: BrowserTab) {
+        guard let page = tab.web else { return }
+        run(PageScripts.call("media", "pause"), in: page)
+        tab.url = page.url ?? tab.url
+        tab.title = page.title ?? tab.title
+        tab.scrollY = page.scrollView?.contentOffset.y ?? tab.scrollY
+        page.isHidden = true
+        let work = DispatchWorkItem { [weak self, weak tab] in
+            guard let self, let tab, tab !== self.currentTab else { return }
+            self.unload(tab)
+        }
+        tab.unloadWork?.cancel()
+        tab.unloadWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: work)
+    }
+
+    private func unload(_ tab: BrowserTab) {
+        guard let page = tab.web else { return }
+        tab.url = page.url ?? tab.url
+        tab.title = page.title ?? tab.title
+        tab.scrollY = page.scrollView?.contentOffset.y ?? tab.scrollY
+        page.delegate = nil
+        page.removeFromSuperview()
+        tab.web = nil
+    }
+
+    /// The TV is running low on memory: unload every tab that isn't on screen.
+    @objc private func memoryIsLow() {
+        for tab in tabs where tab !== currentTab { unload(tab) }
+        LanternWebView.clearEngineMemoryCaches()
+        library.clearMemoryCaches()
+        Task { await IconLoader.shared.clear() }
+    }
+
+    /// You switched to another app: pause the video and keep only the tab you were on, so
+    /// Lantern takes up as little memory as possible while you're away.
+    @objc private func leftLantern() {
+        if let page = web { run(PageScripts.call("media", "pause"), in: page) }
+        for tab in tabs where tab !== currentTab { unload(tab) }
+        LanternWebView.clearEngineMemoryCaches()
+        library.clearMemoryCaches()
+    }
+
+    private func startNewTab() {
+        guard tabs.count < Self.maxTabs else {
+            toast.show("Lantern keeps up to \(Self.maxTabs) tabs. Close one first.", for: 3)
+            return
+        }
+        openNextInNewTab = true
+        close()
+    }
+
+    private func closeTab(at index: Int) {
+        guard tabs.indices.contains(index) else { return }
+        let tab = tabs[index]
+        tab.unloadWork?.cancel()
+        closePopup()
+        unload(tab)
+        tabs.remove(at: index)
+        if tabs.isEmpty {
+            currentTabIndex = 0
+            currentPageKey = nil
+            onPageChange?(nil)
+            publishTabs()
+            close()
+            return
+        }
+        // No tab is on screen any more, so there is nothing to send to the background.
+        currentTabIndex = -1
+        switchToTab(at: min(index, tabs.count - 1))
+    }
+
+    private func publishTabs() {
+        let sites = tabs.compactMap(\.site)
+        onTabsChange?(sites, max(0, currentTabIndex))
+        toolbarModel.tabTitles = tabs.map { tab in
+            let title = tab.web?.title ?? tab.title
+            return title.isEmpty ? (tab.site?.host ?? "New Tab") : title
+        }
+        toolbarModel.currentTab = currentTabIndex
+        toolbarModel.canAddTab = tabs.count < Self.maxTabs
+    }
+
+    private func tab(for page: LanternWebView) -> BrowserTab? {
+        tabs.first { $0.web === page }
     }
 
     private var currentSite: Site? {
@@ -330,6 +502,7 @@ final class BrowserViewController: UIViewController {
         hideTargetOutline()
         popup = newPopup
         newPopup.delegate = self
+        newPopup.layoutZoom = Self.baseZoom
 
         popupBackdrop.backgroundColor = UIColor.black.withAlphaComponent(0.6)
         popupBackdrop.frame = view.bounds
@@ -543,9 +716,9 @@ final class BrowserViewController: UIViewController {
         case .downArrow:
             if !inTheater { pageScroll(1) }
         case .leftArrow:
-            if inTheater { run(PageScripts.call("media", "seek", -10.0)) } else { scroll(dx: -view.bounds.width * 0.35, dy: 0, smooth: true) }
+            if inTheater { run(PageScripts.call("media", "seek", -10.0)) } else { scroll(dx: -view.bounds.width * 0.25, dy: 0, smooth: true) }
         case .rightArrow:
-            if inTheater { run(PageScripts.call("media", "seek", 10.0)) } else { scroll(dx: view.bounds.width * 0.35, dy: 0, smooth: true) }
+            if inTheater { run(PageScripts.call("media", "seek", 10.0)) } else { scroll(dx: view.bounds.width * 0.25, dy: 0, smooth: true) }
         default:
             break
         }
@@ -582,11 +755,17 @@ final class BrowserViewController: UIViewController {
         run(PageScripts.call("click", target.x, target.y, pageWidth))
     }
 
-    /// Clicking the top or bottom of the clickpad scrolls about half a screen.
+    /// Test-only: scrolls down a step, as the page tour does to exercise each page.
+    func tourScroll() {
+        pageScroll(1)
+    }
+
+    /// Clicking the top or bottom of the clickpad scrolls about a quarter of a screen, little
+    /// enough that you don't lose your place.
     private func pageScroll(_ direction: Int) {
         checkScroller { [weak self] in
             guard let self else { return }
-            self.scroll(dx: 0, dy: CGFloat(direction) * self.view.bounds.height * 0.5, smooth: true)
+            self.scroll(dx: 0, dy: CGFloat(direction) * self.view.bounds.height * 0.25, smooth: true)
         }
     }
 
@@ -678,10 +857,12 @@ final class BrowserViewController: UIViewController {
             }
         case .ended, .cancelled:
             let velocity = gesture.velocity(in: view)
-            if let start = panStart, now - start.time < 0.25, abs(velocity.y) > 2200, abs(velocity.y) > abs(velocity.x) * 2 {
-                // A quick flick scrolls the page instead of moving the pointer.
+            if let start = panStart, now - start.time < 0.2, abs(velocity.y) > 3200, abs(velocity.y) > abs(velocity.x) * 2.5 {
+                // A quick, deliberate flick scrolls the page instead of moving the pointer, by at
+                // most about a quarter of a screen so you don't lose your place.
                 setPointer(start.point)
-                scroll(dx: 0, dy: max(-1100, min(1100, velocity.y * 0.3)), smooth: true)
+                let reach = view.bounds.height * 0.25
+                scroll(dx: 0, dy: max(-reach, min(reach, velocity.y * 0.08)), smooth: true)
                 hideTargetOutline()
             }
             panStart = nil
@@ -751,7 +932,14 @@ final class BrowserViewController: UIViewController {
         DispatchQueue.main.asyncAfter(deadline: .now() + wait, execute: work)
     }
 
+    /// Notes how far down the page you are, so a page tvOS had to stop can come back there.
+    private func rememberScrollPosition() {
+        guard let tab = currentTab, let y = tab.web?.scrollView?.contentOffset.y, y > 0 else { return }
+        tab.scrollY = y
+    }
+
     private func hover() {
+        rememberScrollPosition()
         // One check at a time: if the page is slow to answer, the next check simply waits.
         guard !hoverInFlight else {
             hoverAgain = true
@@ -894,10 +1082,15 @@ final class BrowserViewController: UIViewController {
         case .stop:
             web.stopLoading()
             refreshToolbar()
-        case .open(let text):
-            if let url = URLInput.resolve(text) {
-                leavePage { [weak self] in self?.load(url) }
+        case .editAddress:
+            hideToolbar()
+            let current = web.url?.host ?? ""
+            let entry = TextEntryViewController(prompt: current.isEmpty ? "Search or enter website" : "Search or enter website (now \(current))",
+                                                text: "", inputType: "search") { [weak self] text in
+                guard let self, let text, let url = URLInput.resolve(text) else { return }
+                self.leavePage { [weak self] in self?.load(url) }
             }
+            present(entry, animated: true)
         case .favorite:
             guard let url = web.url else { return }
             run(PageScripts.call("info")) { [weak self] result in
@@ -923,8 +1116,17 @@ final class BrowserViewController: UIViewController {
             guard let url = web.url else { return }
             let newZoom = max(0.5, min(2.5, ((zoom + step) * 10).rounded() / 10))
             library.setZoom(newZoom, for: url)
-            web.pageZoom = newZoom
+            web.layoutZoom = newZoom * Self.baseZoom
             refreshToolbar()
+        case .selectTab(let index):
+            hideToolbar()
+            if index != currentTabIndex { switchToTab(at: index) }
+        case .newTab:
+            hideToolbar()
+            startNewTab()
+        case .closeTab:
+            hideToolbar()
+            closeTab(at: currentTabIndex)
         case .help:
             hideToolbar()
             hint.show(for: 12)
@@ -963,7 +1165,7 @@ final class BrowserViewController: UIViewController {
         case "verification":
             if let page = currentPageKey, verificationNoticePage != page {
                 verificationNoticePage = page
-                toast.show("Lantern can't click \u{201C}verify you\u{2019}re human\u{201D} checks; they need a real touch. Some pass on their own if you wait a few seconds.", for: 7)
+                toast.show("Lantern can\u{2019}t click \u{201C}verify you\u{2019}re human\u{201D} checks; they need a real touch. Some pass on their own after a few seconds. Press Back to leave the page.", for: 8)
             }
         case "popupBlocked":
             toast.show("Blocked a pop-up", for: 2)
@@ -1037,6 +1239,39 @@ extension BrowserViewController {
         if command["engine"] != nil {
             return reply(LanternWebView.engineDiagnostics())
         }
+        if let zoom = command["zoom"] as? Double {
+            web?.pageZoom = 1
+            web?.layoutZoom = CGFloat(zoom)
+            return reply("zoom \(zoom)")
+        }
+        if let action = command["action"] as? String {
+            switch action {
+            case "editAddress":
+                perform(.editAddress)
+                return reply("address entry")
+            case "newTab": perform(.newTab)
+            case "closeTab": perform(.closeTab)
+            case "nextTab": perform(.selectTab((currentTabIndex + 1) % max(1, tabs.count)))
+            case "unloadOthers": memoryIsLow()
+            case "tabs":
+                return reply(tabs.enumerated().map { index, tab in
+                    "\(index == currentTabIndex ? "*" : " ")\(index): \(tab.web == nil ? "unloaded" : "loaded") \(tab.url?.host ?? "-") y=\(Int(tab.web?.scrollView?.contentOffset.y ?? tab.scrollY))"
+                }.joined(separator: " | "))
+            case "zoomIn": perform(.zoomIn)
+            case "zoomOut": perform(.zoomOut)
+            default: break
+            }
+            return reply(toolbarModel.zoomText)
+        }
+        if let words = command["dictate"] as? String {
+            (presentedViewController as? TextEntryViewController)?.simulateDictation(
+                words, pieces: command["pieces"] as? Int ?? 1, quietly: command["quietly"] != nil)
+            return reply(presentedViewController is TextEntryViewController ? "dictated" : "no keyboard open")
+        }
+        if let letter = command["keypress"] as? String {
+            (presentedViewController as? TextEntryViewController)?.simulateKeyPress(letter)
+            return reply("typed \(letter)")
+        }
         if command["dismiss"] != nil {
             presentedViewController?.dismiss(animated: true)
             return reply("dismissed")
@@ -1044,7 +1279,7 @@ extension BrowserViewController {
         if command["toolbar"] as? String == "hide" {
             hideToolbar()
         }
-        reply("presented \(presentedViewController.map { String(describing: type(of: $0)) } ?? "none") outline \(targetOutline.alpha > 0) toolbar \(toolbarVisible) theater \(inTheater) media \(mediaSeen) pointer \(pointerPosition) style \(pointer.style)")
+        reply("pageMB \((web?.pageMemoryFootprint ?? 0) / 1_048_576) presented \(presentedViewController.map { String(describing: type(of: $0)) } ?? "none") outline \(targetOutline.alpha > 0) toolbar \(toolbarVisible) theater \(inTheater) media \(mediaSeen) pointer \(pointerPosition) style \(pointer.style)")
     }
 }
 
@@ -1058,8 +1293,18 @@ private extension ToolbarAction {
 extension BrowserViewController: LanternWebViewDelegate {
     func webViewStateDidChange(_ webView: LanternWebView) {
         guard webView === web else {
-            updatePopupTitle()
+            if webView === popup {
+                updatePopupTitle()
+            } else if let tab = tab(for: webView) {
+                tab.url = webView.url ?? tab.url
+                tab.title = webView.title ?? tab.title
+                publishTabs()
+            }
             return
+        }
+        if let tab = currentTab {
+            tab.url = webView.url ?? tab.url
+            tab.title = webView.title ?? tab.title
         }
         let loading = webView.isLoading
         progressBar.setProgress(Float(webView.estimatedProgress), animated: true)
@@ -1072,10 +1317,11 @@ extension BrowserViewController: LanternWebViewDelegate {
             currentPageKey = key
             resetPageWork()
             if let url = webView.url { notePageVisit(url) }
-            if let url = webView.url { webView.pageZoom = library.zoom(for: url) }
+            if let url = webView.url { webView.layoutZoom = library.zoom(for: url) * Self.baseZoom }
             mediaSeen = false
             if inTheater { setTheater(false) }
             onPageChange?(currentSite)
+            publishTabs()
         }
         if toolbarVisible {
             toolbarModel.canGoBack = webView.canGoBack
@@ -1086,6 +1332,17 @@ extension BrowserViewController: LanternWebViewDelegate {
 
     func webView(_ webView: LanternWebView, didFinishLoading url: URL?) {
         guard webView === web, let url else { return }
+        // A tab that was unloaded comes back where you were.
+        if let tab = currentTab, tab.restoreScrollOnLoad {
+            tab.restoreScrollOnLoad = false
+            let y = tab.scrollY
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                guard let scrollView = webView.scrollView else { return }
+                let maxY = max(0, scrollView.contentSize.height - scrollView.bounds.height)
+                scrollView.setContentOffset(CGPoint(x: 0, y: min(y, maxY)), animated: false)
+            }
+        }
+        publishTabs()
         run(PageScripts.call("info"), in: webView) { [weak self] result in
             guard let self else { return }
             let icon = ((result as? [String: Any])?["icon"] as? String).flatMap(URL.init(string:))
@@ -1104,6 +1361,14 @@ extension BrowserViewController: LanternWebViewDelegate {
             closePopup()
             return
         }
+        // A background tab whose page stopped just reloads when you return to it.
+        if webView !== web, let tab = tab(for: webView) {
+            unload(tab)
+            return
+        }
+        let reasons = [0: "too much memory", 1: "too much CPU", 2: "stopped by Lantern", 3: "crashed"]
+        let reason = reasons[webView.lastStopReason] ?? "no reason given"
+        PageHealthLog.record("stopped", url: webView.url ?? currentTab?.url, detail: reason)
         resetPageWork()
         // Lantern shut down a frozen page on purpose; carry on with what you asked for.
         if let action = afterFrozenPageStops {
@@ -1115,9 +1380,11 @@ extension BrowserViewController: LanternWebViewDelegate {
         defer { lastPageCrash = now }
         // Reload once; a page that crashes again right away is left alone instead of looping.
         if let last = lastPageCrash, now.timeIntervalSince(last) < 60 {
-            toast.show("This page keeps crashing, so Lantern stopped reloading it. Press Back to leave it.", for: 8)
+            toast.show("This page keeps running out of memory, so Lantern stopped reloading it. Press Back to leave it, or close other apps on the TV to free memory.", for: 9)
         } else {
-            toast.show("This page stopped working, so Lantern reloaded it.", for: 4)
+            toast.show(webView.lastStopReason == 3 ? "This page crashed, so Lantern reloaded it." : "This page ran out of memory, so Lantern reloaded it.", for: 4)
+            rememberScrollPosition()
+            currentTab?.restoreScrollOnLoad = true
             webView.reload()
         }
     }

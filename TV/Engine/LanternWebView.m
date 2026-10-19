@@ -1,6 +1,10 @@
 #import "LanternWebView.h"
 
 #import <dlfcn.h>
+#import <sys/resource.h>
+
+// Declared in libproc.h, which the tvOS SDK doesn't ship.
+extern int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);
 #import <objc/message.h>
 #import <objc/runtime.h>
 
@@ -111,6 +115,7 @@ static NSMapTable *LanternOwnersByEngine(void) {
 - (void)bridgeDidFailWithError:(NSError *)error;
 - (void)bridgeLoadRequest:(NSURLRequest *)request;
 - (void)bridgeContentProcessTerminated;
+- (void)bridgeContentProcessTerminatedWithReason:(NSInteger)reason;
 - (void)bridgeDidClose;
 - (UIView *)engineView;
 - (instancetype)initPopupWithFrame:(CGRect)frame configuration:(id)configuration opener:(LanternWebView *)opener NS_DESIGNATED_INITIALIZER;
@@ -163,6 +168,11 @@ static NSMapTable *LanternOwnersByEngine(void) {
 
 - (void)webViewWebContentProcessDidTerminate:(id)webView {
     [self.owner bridgeContentProcessTerminated];
+}
+
+// The engine prefers this version when present, and says why the page's process stopped.
+- (void)_webView:(id)webView webContentProcessDidTerminateWithReason:(NSInteger)reason {
+    [self.owner bridgeContentProcessTerminatedWithReason:reason];
 }
 
 - (void)webView:(id)webView
@@ -271,6 +281,19 @@ static NSMapTable *LanternOwnersByEngine(void) {
     return LanternLoadEngine();
 }
 
++ (void)clearEngineMemoryCaches {
+    if (!LanternLoadEngine()) {
+        return;
+    }
+    id store = LanternGet(NSClassFromString(@"WKWebsiteDataStore"), @"defaultDataStore");
+    SEL remove = NSSelectorFromString(@"removeDataOfTypes:modifiedSince:completionHandler:");
+    if (store == nil || ![store respondsToSelector:remove]) {
+        return;
+    }
+    void (^done)(void) = ^{};
+    ((void (*)(id, SEL, id, id, id))objc_msgSend)(store, remove, [NSSet setWithObject:@"WKWebsiteDataTypeMemoryCache"], [NSDate distantPast], done);
+}
+
 + (NSString *)engineDiagnostics {
     if (!LanternLoadEngine()) {
         return @"engine unavailable";
@@ -283,7 +306,8 @@ static NSMapTable *LanternOwnersByEngine(void) {
     id features = LanternGet(NSClassFromString(@"WKPreferences"), @"_features");
     for (id feature in features) {
         NSString *key = LanternGet(feature, @"key");
-        if ([key.lowercaseString containsString:@"media"] || [key.lowercaseString containsString:@"source"]) {
+        if ([key.lowercaseString containsString:@"media"] || [key.lowercaseString containsString:@"source"]
+            || [key.lowercaseString containsString:@"cache"] || [key.lowercaseString containsString:@"memory"]) {
             BOOL enabled = NO;
             SEL isEnabled = NSSelectorFromString(@"_isEnabledForFeature:");
             if ([preferences respondsToSelector:isEnabled]) {
@@ -332,15 +356,26 @@ static NSMapTable *LanternOwnersByEngine(void) {
     SEL setFeature = NSSelectorFromString(@"_setEnabled:forFeature:");
     if ([preferences respondsToSelector:setFeature]) {
         for (id feature in LanternGet(NSClassFromString(@"WKPreferences"), @"_features")) {
-            if ([wantedFeatures containsObject:LanternGet(feature, @"key")]) {
+            NSString *key = LanternGet(feature, @"key");
+            if ([wantedFeatures containsObject:key]) {
                 ((void (*)(id, SEL, BOOL, id))objc_msgSend)(preferences, setFeature, YES, feature);
+            } else if ([key isEqualToString:@"UsesBackForwardCache"]) {
+                // Keeping previous pages alive for an instant Back makes each page process keep
+                // growing as you browse, and tvOS kills a page process at about 900 MB. Back
+                // reloads the page instead.
+                ((void (*)(id, SEL, BOOL, id))objc_msgSend)(preferences, setFeature, NO, feature);
+            } else if ([key hasPrefix:@"WebAuthentication"] || [key hasPrefix:@"DigitalCredentials"]) {
+                // Passkey requests reach tvOS's "sign in with iPhone" service, which crashes
+                // the app on Apple TV. Sites fall back to passwords when passkeys are off.
+                ((void (*)(id, SEL, BOOL, id))objc_msgSend)(preferences, setFeature, NO, feature);
             }
         }
     }
 
-    // Ask sites for their desktop layout; the TV screen is wide, and page zoom keeps text readable.
+    // Pages lay out to the screen's real width so zoom behaves like Safari's (see
+    // bridgeApplySiteModeForURL:preferences:).
     id webpagePreferences = LanternGet(configuration, @"defaultWebpagePreferences");
-    LanternSetInteger(webpagePreferences, @"setPreferredContentMode:", 2);
+    LanternSetInteger(webpagePreferences, @"setPreferredContentMode:", 1);
 
     Class worldClass = NSClassFromString(@"WKContentWorld");
     _scriptWorld = ((id (*)(id, SEL, id))objc_msgSend)(worldClass, NSSelectorFromString(@"worldWithName:"), @"lantern");
@@ -402,6 +437,14 @@ static NSMapTable *LanternOwnersByEngine(void) {
 
     UIScrollView *scrollView = LanternGet(engine, @"scrollView");
     scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+
+    // Lay every page out to the screen's width, whatever width the page asks for, the way a
+    // desktop browser does. Then page zoom decides how wide the layout is, so zooming in makes
+    // text bigger and the page rewraps. Without this, pages that ask for a fixed width (or
+    // none) are stretched to fit the screen, which cancels zoom out.
+    _layoutZoom = 1;
+    _lastStopReason = -1;
+    [self applyLayoutZoom];
 
     [self addSubview:engine];
     _engine = engine;
@@ -471,6 +514,36 @@ static NSMapTable *LanternOwnersByEngine(void) {
 
 - (BOOL)canGoForward {
     return LanternGetBool(_engine, @"canGoForward");
+}
+
+- (void)setLayoutZoom:(CGFloat)layoutZoom {
+    _layoutZoom = MAX(0.25, layoutZoom);
+    [self applyLayoutZoom];
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    [self applyLayoutZoom];
+}
+
+/// Tells the engine to lay pages out as if the screen were narrower by the zoom factor, at a
+/// fixed scale that fills the view, whatever the page itself asks for.
+- (void)applyLayoutZoom {
+    SEL overrideViewport = NSSelectorFromString(@"_overrideViewportWithArguments:");
+    CGFloat viewWidth = self.bounds.size.width;
+    if (_engine == nil || viewWidth <= 0 || ![_engine respondsToSelector:overrideViewport]) {
+        return;
+    }
+    NSString *width = [NSString stringWithFormat:@"%ld", (long)lround(viewWidth / _layoutZoom)];
+    NSString *scale = [NSString stringWithFormat:@"%.4f", viewWidth / lround(viewWidth / _layoutZoom)];
+    NSDictionary *arguments = @{
+        @"width": width,
+        @"initial-scale": scale,
+        @"minimum-scale": scale,
+        @"maximum-scale": scale,
+        @"user-scalable": @"no",
+    };
+    ((void (*)(id, SEL, id))objc_msgSend)(_engine, overrideViewport, arguments);
 }
 
 - (CGFloat)pageZoom {
@@ -641,6 +714,25 @@ static NSMapTable *LanternOwnersByEngine(void) {
     }
 }
 
+- (void)bridgeContentProcessTerminatedWithReason:(NSInteger)reason {
+    _lastStopReason = reason;
+    [self bridgeContentProcessTerminated];
+    _lastStopReason = -1;
+}
+
+- (uint64_t)pageMemoryFootprint {
+    SEL selector = NSSelectorFromString(@"_webProcessIdentifier");
+    if (![_engine respondsToSelector:selector]) {
+        return 0;
+    }
+    pid_t pid = ((pid_t (*)(id, SEL))objc_msgSend)(_engine, selector);
+    struct rusage_info_v4 info;
+    if (pid <= 0 || proc_pid_rusage(pid, RUSAGE_INFO_V4, (rusage_info_t *)&info) != 0) {
+        return 0;
+    }
+    return info.ri_phys_footprint;
+}
+
 - (void)bridgeContentProcessTerminated {
     if ([self.delegate respondsToSelector:@selector(webViewContentProcessDidTerminate:)]) {
         [self.delegate webViewContentProcessDidTerminate:self];
@@ -656,8 +748,10 @@ static NSMapTable *LanternOwnersByEngine(void) {
 - (void)bridgeApplySiteModeForURL:(NSURL *)url preferences:(id)preferences {
     BOOL mobile = url != nil && self.prefersMobileSite != nil && self.prefersMobileSite(url);
     NSString *agent = mobile ? self.mobileUserAgent : self.desktopUserAgent;
-    // 1 and 2 are WKContentModeMobile and WKContentModeDesktop.
-    LanternSetInteger(preferences, @"setPreferredContentMode:", mobile ? 1 : 2);
+    // Lay every page out to the screen's real width (1 is WKContentModeMobile). The engine's
+    // desktop mode refits pages to the screen with its own scaling, which cancels out zoom;
+    // sites still get the desktop version from the desktop identity below.
+    LanternSetInteger(preferences, @"setPreferredContentMode:", 1);
     LanternSetObject(preferences, @"_setCustomUserAgent:", agent);
     LanternSetObject(_engine, @"setCustomUserAgent:", agent);
 }

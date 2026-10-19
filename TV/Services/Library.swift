@@ -30,7 +30,12 @@ final class Library: ObservableObject {
 
     private let defaults = UserDefaults.standard
     private let historyLimit = 200
-    private var snapshotCache: [String: UIImage] = [:]
+    /// Recently shown snapshots. Capped, and emptied when memory runs low.
+    private let snapshotCache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = 24
+        return cache
+    }()
     private let snapshotFolder: URL = {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         let folder = caches.appendingPathComponent("Snapshots", isDirectory: true)
@@ -43,6 +48,7 @@ final class Library: ObservableObject {
         static let history = "history"
         static let seeded = "seededFavorites"
         static let mobileHosts = "mobileHosts"
+        static let addedMobileHosts = "addedMobileHosts"
         static let siteZooms = "siteZooms"
     }
 
@@ -50,6 +56,12 @@ final class Library: ObservableObject {
         favorites = decode(Keys.favorites)
         history = decode(Keys.history)
         mobileHosts = (defaults.stringArray(forKey: Keys.mobileHosts)).map(Set.init) ?? Self.defaultMobileHosts
+        // Sites added to the defaults later are added once, so switching one back to its desktop
+        // version afterwards sticks.
+        let added = Set(defaults.stringArray(forKey: Keys.addedMobileHosts) ?? [])
+        mobileHosts.formUnion(Self.defaultMobileHosts.subtracting(added))
+        defaults.set(Array(Self.defaultMobileHosts), forKey: Keys.addedMobileHosts)
+        defaults.set(Array(mobileHosts), forKey: Keys.mobileHosts)
         if !defaults.bool(forKey: Keys.seeded) {
             favorites = Self.starterFavorites
             defaults.set(true, forKey: Keys.seeded)
@@ -129,7 +141,9 @@ final class Library: ObservableObject {
     /// Sites to open in their iPhone version. The TV can't play the streaming format most
     /// desktop sites use, but it plays the HLS video sites send iPhones.
     private(set) var mobileHosts: Set<String> = []
-    private static let defaultMobileHosts: Set<String> = ["youtube.com"]
+    /// YouTube's mobile site sends video the TV can play; LinkedIn's desktop feed crashes the
+    /// TV's web engine, while its mobile site works.
+    private static let defaultMobileHosts: Set<String> = ["youtube.com", "linkedin.com"]
 
     func prefersMobileSite(_ url: URL) -> Bool {
         guard let host = url.host?.lowercased() else { return false }
@@ -177,18 +191,23 @@ final class Library: ObservableObject {
 
     func snapshot(for url: URL) -> UIImage? {
         let key = Self.key(for: url)
-        if let cached = snapshotCache[key] { return cached }
+        if let cached = snapshotCache.object(forKey: key as NSString) { return cached }
         guard let image = UIImage(contentsOfFile: snapshotFile(for: key).path) else { return nil }
-        snapshotCache[key] = image
+        snapshotCache.setObject(image, forKey: key as NSString)
         return image
     }
 
     func saveSnapshot(_ image: UIImage, for url: URL) {
         let key = Self.key(for: url)
-        snapshotCache[key] = image
+        snapshotCache.setObject(image, forKey: key as NSString)
         snapshotRevision += 1
         guard let data = image.jpegData(compressionQuality: 0.7) else { return }
         try? data.write(to: snapshotFile(for: key), options: .atomic)
+    }
+
+    /// Frees snapshots held in memory; they reload from disk when shown again.
+    func clearMemoryCaches() {
+        snapshotCache.removeAllObjects()
     }
 
     private func snapshotFile(for key: String) -> URL {

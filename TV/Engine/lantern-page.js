@@ -8,6 +8,20 @@
   const VERIFICATION = /(^|\.)(challenges\.cloudflare\.com|hcaptcha\.com|recaptcha\.net|arkoselabs\.com|funcaptcha\.com|perimeterx\.net|px-cdn\.net|px-cloud\.net|captcha-delivery\.com)$/;
   if (VERIFICATION.test(location.hostname) || (/(^|\.)google\.com$/.test(location.hostname) && location.pathname.startsWith('/recaptcha'))) return;
 
+  // Passkeys: a passkey request crashes Lantern on Apple TV (inside tvOS's sign-in service),
+  // so pages are told passkeys aren't available and offer their password sign-in instead.
+  try {
+    Object.defineProperty(window, 'PublicKeyCredential', { value: undefined, configurable: true, writable: true });
+    const credentials = navigator.credentials;
+    if (credentials) {
+      const refuse = () => Promise.reject(new DOMException('Passkeys are not available on this device.', 'NotAllowedError'));
+      const get = credentials.get.bind(credentials);
+      const create = credentials.create.bind(credentials);
+      credentials.get = (options) => (options && (options.publicKey || options.digital) ? refuse() : get(options));
+      credentials.create = (options) => (options && options.publicKey ? refuse() : create(options));
+    }
+  } catch (e) {}
+
   let fullscreenElement = null;
 
   const define = (proto, name, value) => {

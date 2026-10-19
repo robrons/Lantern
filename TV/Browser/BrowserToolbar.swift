@@ -2,8 +2,8 @@ import SwiftUI
 
 enum ToolbarAction {
     case home, back, forward, reload, stop
-    case open(String)
     case favorite, theater, siteVersion, pointerSpeed, zoomIn, zoomOut, help, dismiss
+    case selectTab(Int), newTab, closeTab, editAddress
 }
 
 @MainActor
@@ -16,6 +16,9 @@ final class ToolbarModel: ObservableObject {
     @Published var isMobileSite = false
     @Published var zoomText = "100%"
     @Published var pointerSpeedName = "Normal"
+    @Published var tabTitles: [String] = []
+    @Published var currentTab = 0
+    @Published var canAddTab = true
     /// Bumped each time the toolbar opens, to move focus back to the Back button.
     @Published var openCount = 0
 
@@ -30,12 +33,36 @@ struct BrowserToolbar: View {
 
     private enum Item: Hashable {
         case back
-        case other
+        case address
     }
 
     var body: some View {
         VStack {
             VStack(spacing: 22) {
+                // Tabs.
+                HStack(spacing: 14) {
+                    ForEach(Array(model.tabTitles.enumerated()), id: \.offset) { index, title in
+                        Button {
+                            model.perform(.selectTab(index))
+                        } label: {
+                            Label(title, systemImage: index == model.currentTab ? "square.fill.on.square.fill" : "square.on.square")
+                                .font(.callout)
+                                .lineLimit(1)
+                                .frame(maxWidth: 380)
+                        }
+                    }
+                    Button {
+                        model.perform(.newTab)
+                    } label: {
+                        Label("New Tab", systemImage: "plus")
+                            .font(.callout)
+                            .fixedSize()
+                    }
+                    .disabled(!model.canAddTab)
+                    Spacer(minLength: 0)
+                    labelButton("Close Tab", "xmark.square", .closeTab)
+                }
+
                 // Getting around.
                 HStack(spacing: 18) {
                     iconButton("house.fill", "Home", .home)
@@ -49,9 +76,14 @@ struct BrowserToolbar: View {
                     } else {
                         iconButton("arrow.clockwise", "Reload", .reload)
                     }
-                    TextField("Search or enter website", text: $model.address)
-                        .onSubmit { model.perform(.open(model.address)) }
-                        .frame(maxWidth: .infinity)
+                    Button {
+                        model.perform(.editAddress)
+                    } label: {
+                        Label(model.address.isEmpty ? "Search or enter website" : model.address, systemImage: "magnifyingglass")
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .focused($focused, equals: .address)
                 }
 
                 // This page.
@@ -84,7 +116,8 @@ struct BrowserToolbar: View {
         .onPlayPauseCommand { model.perform(.dismiss) }
         .defaultFocus($focused, .back)
         .onChange(of: model.openCount) {
-            DispatchQueue.main.async { focused = model.canGoBack ? .back : nil }
+            // Start on Back, or on the address bar when there's nowhere to go back to.
+            DispatchQueue.main.async { focused = model.canGoBack ? .back : .address }
         }
     }
 

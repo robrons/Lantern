@@ -38,6 +38,9 @@ NS_SWIFT_UI_ACTOR
 /// Whether the web engine could be loaded on this device.
 + (BOOL)isEngineAvailable;
 
+/// Empties the engine's in-memory web cache (pages, images and scripts it keeps for reuse).
++ (void)clearEngineMemoryCaches;
+
 /// Test-only: the engine's media-related settings and whether Lantern could change them.
 + (NSString *)engineDiagnostics;
 
@@ -57,6 +60,15 @@ NS_SWIFT_UI_ACTOR
 @property (nonatomic, readonly) BOOL canGoBack;
 @property (nonatomic, readonly) BOOL canGoForward;
 @property (nonatomic) CGFloat pageZoom;
+/// How much memory the page's process is using, in bytes. The simulator reports it; on a real
+/// Apple TV tvOS doesn't, and this is 0.
+@property (nonatomic, readonly) uint64_t pageMemoryFootprint;
+/// Why the page's process last stopped: 0 too much memory, 1 too much CPU, 2 stopped by
+/// Lantern, 3 crashed, or -1 if the engine didn't say.
+@property (nonatomic, readonly) NSInteger lastStopReason;
+/// Zoom by giving the page a narrower screen to lay out to, which the engine then scales up to
+/// fill the view (how phones zoom). Unlike `pageZoom`, every size the page measures agrees.
+@property (nonatomic) CGFloat layoutZoom;
 /// The page's own scroll view, for smooth native scrolling of the whole page.
 @property (nonatomic, readonly, nullable) UIScrollView *scrollView;
 /// Identities to give sites; which one a page gets is decided by `prefersMobileSite`.

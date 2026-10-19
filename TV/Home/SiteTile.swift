@@ -106,11 +106,19 @@ actor IconLoader {
                   (response as? HTTPURLResponse)?.statusCode == 200,
                   let image = UIImage(data: data), image.size.width >= 16
             else { continue }
+            // Icons are small, but don't let a long session collect them without limit.
+            if cache.count >= 80 { cache.removeAll() }
             cache[key] = image
             return image
         }
         missing.insert(key)
         return nil
+    }
+
+    /// Frees the icons held in memory; they're fetched again when needed.
+    func clear() {
+        cache.removeAll()
+        missing.removeAll()
     }
 }
 

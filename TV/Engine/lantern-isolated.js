@@ -21,6 +21,22 @@
     try { win.postMessage(Object.assign({ __lantern: TOKEN }, data), '*'); } catch (e) {}
   };
 
+  // The boxes these checks put on a page. Many hide their checkbox in a sealed part of the
+  // page, so Lantern recognises the box itself and keeps its hands off it too.
+  const VERIFICATION_BOX = [
+    '.cf-turnstile', '#turnstile-wrapper', '#challenge-stage', '[id^="cf-chl-widget"]',
+    '.g-recaptcha', '.h-captcha', '#px-captcha', '[data-sitekey]',
+    'iframe[src*="challenges.cloudflare.com"]', 'iframe[src*="hcaptcha.com"]',
+    'iframe[src*="/recaptcha/"]', 'iframe[src*="captcha-delivery.com"]',
+  ].join(', ');
+
+  function isVerificationBox(el) {
+    for (let e = el, depth = 0; e && e.nodeType === 1 && depth < 12; e = parentOf(e), depth++) {
+      try { if (e.matches(VERIFICATION_BOX)) return true; } catch (err) { return false; }
+    }
+    return false;
+  }
+
   const parentOf = (node) => {
     if (node.parentElement) return node.parentElement;
     const root = node.getRootNode && node.getRootNode();
@@ -204,6 +220,10 @@
 
   function hoverAt(x, y) {
     const target = targetAt(x, y);
+    if (target && isVerificationBox(target.hit)) {
+      hovered = null;
+      return { kind: 'none' };
+    }
     const el = target ? target.hit : null;
     const px = target ? target.x : x;
     const py = target ? target.y : y;
@@ -247,8 +267,19 @@
     const target = targetAt(pointerX, pointerY);
     if (!target) return 'none';
     const el = target.hit;
+    if (isVerificationBox(el)) {
+      post({ type: 'verification' });
+      return 'none';
+    }
+    markUserAction();
     const x = target.x;
     const y = target.y;
+
+    const stopped = parkedVideoAt(pointerX, pointerY);
+    if (stopped && unpark(stopped)) {
+      activeMedia = stopped;
+      return 'video';
+    }
 
     if (isFrame(el)) {
       const p = framePoint(el, x, y);
@@ -395,6 +426,66 @@
   const matters = (media) => media.tagName === 'AUDIO' || !media.muted
     || visibleArea(media) > innerWidth * innerHeight * 0.25;
 
+  // ---- Muted videos that start by themselves ----
+  //
+  // Pages often autoplay muted clips: backgrounds, previews, video ads. A paused video keeps
+  // everything it loaded, so on a 4 GB TV these are stopped *and unloaded* unless they're the
+  // page's main video or you just clicked. Clicking one brings it back.
+
+  let lastUserAction = 0;
+  const markUserAction = () => { lastUserAction = Date.now(); };
+  const parked = new WeakMap();
+
+  function isMainVideo(video) {
+    const area = visibleArea(video);
+    if (area < innerWidth * innerHeight * 0.2) return false;
+    for (const other of document.querySelectorAll('video')) {
+      if (other !== video && !other.paused && visibleArea(other) > area) return false;
+    }
+    return true;
+  }
+
+  function park(video) {
+    if (parked.has(video)) {
+      video.pause();
+      return;
+    }
+    const sources = Array.from(video.querySelectorAll('source')).map((source) => [source, source.getAttribute('src')]);
+    parked.set(video, { src: video.getAttribute('src'), sources });
+    video.pause();
+    video.removeAttribute('src');
+    for (const [source] of sources) source.removeAttribute('src');
+    video.load();
+  }
+
+  function unpark(video) {
+    const saved = parked.get(video);
+    if (!saved) return false;
+    parked.delete(video);
+    if (saved.src) video.setAttribute('src', saved.src);
+    for (const [source, src] of saved.sources) if (src) source.setAttribute('src', src);
+    video.load();
+    video.play().catch(() => {});
+    return true;
+  }
+
+  /// A stopped video under the point, if there is one.
+  function parkedVideoAt(x, y) {
+    for (const video of document.querySelectorAll('video')) {
+      if (!parked.has(video)) continue;
+      const r = video.getBoundingClientRect();
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return video;
+    }
+    return null;
+  }
+
+  document.addEventListener('play', (event) => {
+    const video = event.target;
+    if (!(video instanceof HTMLVideoElement) || !video.muted) return;
+    if (Date.now() - lastUserAction < 3000 || isMainVideo(video)) return;
+    park(video);
+  }, true);
+
   for (const type of ['play', 'pause', 'ended']) {
     document.addEventListener(type, (event) => {
       const media = event.target;
@@ -405,6 +496,7 @@
   }
 
   function controlMedia(action, value) {
+    markUserAction();
     const media = activeMedia && activeMedia.isConnected ? activeMedia : null;
     if (!media) {
       for (const frame of frames()) send(frame.contentWindow, { t: 'media', action, value });
@@ -413,6 +505,8 @@
     if (action === 'toggle') {
       if (media.paused || media.ended) media.play().catch(() => {});
       else media.pause();
+    } else if (action === 'pause') {
+      media.pause();
     } else if (action === 'seek') {
       const end = Number.isFinite(media.duration) ? media.duration : Infinity;
       media.currentTime = Math.max(0, Math.min(end, media.currentTime + value));
@@ -575,6 +669,7 @@
   /// Full screen for whatever is playing: Apple's player if possible, otherwise the page's
   /// video stretched over the whole screen.
   function fullScreen(target) {
+    markUserAction();
     const el = target || (activeMedia && activeMedia.isConnected ? activeMedia : null) || bestStageTarget();
     if (!el) return false;
     if (isFrame(el)) {

@@ -13,10 +13,11 @@ tvOS ships Safari's web engine but doesn't let apps use it. Lantern loads it any
 - **Pointer for the Siri Remote.** Swipe to move a smooth, steady pointer. A tvOS-style outline shows what a click will select, and clicks land on the nearest link or button, so you don't need pinpoint aim. Choose Slow, Normal or Fast pointer speed.
 - **Full-screen video in Apple's player.** Hold Play/Pause (or use a site's own full-screen button) and the video opens in AVKit's player: true full screen, audio in sync, click to pause, swipe to scrub.
 - **Works with embedded players.** Clicks, typing and full screen reach video players inside frames from other sites.
-- **Typing.** Clicking a text field opens the tvOS keyboard, so typing from your iPhone and dictation work as usual.
+- **Typing.** Clicking a text field opens the tvOS keyboard, so typing from your iPhone and dictation work as usual. After you dictate, the keyboard closes and submits by itself, with no trip to the Done button.
+- **Tabs.** Up to three tabs. Tabs you leave are paused, then unloaded after a while (or straight away if the TV runs low on memory) and reloaded where you left off.
 - **Sign-in windows, without ad pop-ups.** "Sign in with Google" and similar windows open over the page and stay connected to it, so sign-ins complete and the window closes itself. Other windows opened by scripts are blocked, and requests to common ad and pop-under networks are blocked by WebKit content rules, including redirects that try to jump to an ad page.
 - **Home screen.** Favorites, recently visited sites with page snapshots, a Continue tile, and full history.
-- **Per-site settings.** Each site remembers its zoom and whether to show the desktop or mobile version. YouTube defaults to mobile, whose video the TV can play.
+- **Per-site settings.** Each site remembers its zoom and whether to show the desktop or mobile version. YouTube and LinkedIn default to mobile, which the TV handles better.
 - **Stays responsive.** Lantern never queues work onto a slow page. If a page freezes, Back, Home and Reload shut it down and carry on.
 
 ![The menu](docs/menu.png)
@@ -27,8 +28,8 @@ tvOS ships Safari's web engine but doesn't let apps use it. Lantern loads it any
 | --- | --- |
 | Swipe | Move the pointer; push past the top or bottom edge to scroll |
 | Click | Select what's outlined |
-| Hold the click | Open the menu: address bar, back/forward, favorite, full screen, site version, zoom, pointer speed |
-| Click the top or bottom of the clickpad | Scroll half a screen |
+| Hold the click | Open the menu: tabs, address bar, back/forward, favorite, full screen, site version, zoom, pointer speed |
+| Click the top or bottom of the clickpad | Scroll a quarter of a screen |
 | Back | Previous page, then Lantern's home; on the home screen, press twice to leave |
 | Play/Pause | Play or pause the page's video |
 | Hold Play/Pause | Full screen |

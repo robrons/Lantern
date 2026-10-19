@@ -7,6 +7,12 @@ final class Router: ObservableObject {
 
     var openURL: (URL) -> Void = { _ in }
     var resume: () -> Void = {}
+    /// The browser's open tabs, and which one was on screen last.
+    @Published var tabs: [Site] = []
+    @Published var currentTabIndex = 0
+    var resumeTab: (Int) -> Void = { _ in }
+    /// Opens the keyboard screen for a search or address.
+    var askForAddress: () -> Void = {}
 
     func open(text: String) {
         if let url = URLInput.resolve(text) { openURL(url) }
@@ -16,7 +22,6 @@ final class Router: ObservableObject {
 struct HomeView: View {
     @ObservedObject var library: Library
     @ObservedObject var router: Router
-    @State private var query = ""
     /// Set after one Back press; a second Back within a moment leaves Lantern.
     @State private var leaveArmed = false
 
@@ -26,7 +31,13 @@ struct HomeView: View {
                 VStack(alignment: .leading, spacing: 60) {
                     header
 
-                    if let page = router.currentPage {
+                    if router.tabs.count > 1 {
+                        Shelf(title: "Open Tabs") {
+                            ForEach(Array(router.tabs.enumerated()), id: \.offset) { index, site in
+                                SiteTile(site: site, library: library, width: 480) { router.resumeTab(index) }
+                            }
+                        }
+                    } else if let page = router.currentPage {
                         Shelf(title: "Continue") {
                             SiteTile(site: page, library: library, width: 560) { router.resume() }
                         }
@@ -102,11 +113,12 @@ struct HomeView: View {
             }
             .font(.title2.bold())
             .labelStyle(.titleAndIcon)
-            TextField("Search or enter website", text: $query)
-                .onSubmit {
-                    router.open(text: query)
-                    query = ""
-                }
+            Button {
+                router.askForAddress()
+            } label: {
+                Label("Search or enter website", systemImage: "magnifyingglass")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             NavigationLink {
                 HistoryView(library: library) { router.openURL($0) }
             } label: {

@@ -50,7 +50,7 @@ final class RemoteHintView: UIView {
         ("hand.point.up.left", "Swipe to move the pointer. Push it past the top or bottom edge to scroll."),
         ("hand.tap", "Click to select. Hold the click to open the menu with the address bar."),
         ("plus.magnifyingglass", "Zoom in or out from the menu. Each site remembers its zoom."),
-        ("chevron.up.chevron.down", "Click the top or bottom of the clickpad to scroll a page at a time."),
+        ("chevron.up.chevron.down", "Click the top or bottom of the clickpad to scroll a little at a time."),
         ("arrow.uturn.backward", "Back goes to the previous page, then home."),
         ("playpause", "Play/Pause plays or pauses the video on the page. Hold it for full screen."),
     ]
