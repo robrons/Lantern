@@ -18,7 +18,7 @@ enum URLInput {
         }
 
         var components = URLComponents(string: "https://www.google.com/search")!
-        components.queryItems = [URLQueryItem(name: "q", value: trimmed)]
+        components.queryItems = [URLQueryItem(name: "q", value: trimmed), URLQueryItem(name: "safe", value: "active")]
         return components.url
     }
 }

@@ -1,0 +1,56 @@
+# Food delivery and takeout ordering sites Lantern won't open. Subdomains are blocked too.
+# A name ending in .* is blocked under every country's domain (deliveroo.co.uk, deliveroo.fr...).
+
+# Delivery apps
+ubereats.com
+postmates.com
+doordash.com
+trycaviar.com
+grubhub.com
+seamless.com
+delivery.com
+favordelivery.com
+waitrapp.com
+skipthedishes.com
+deliveroo.*
+just-eat.*
+justeat.*
+takeaway.com
+lieferando.*
+thuisbezorgd.nl
+pyszne.pl
+wolt.com
+glovoapp.com
+foodora.*
+foodpanda.*
+talabat.com
+hungerstation.com
+jahez.net
+swiggy.com
+zomato.com
+menulog.*
+rappi.*
+ifood.com.br
+pedidosya.*
+didi-food.com
+baemin.com
+coupangeats.com
+yogiyo.co.kr
+demae-can.com
+
+# Restaurant online ordering
+slicelife.com
+chownow.com
+order.toasttab.com
+beyondmenu.com
+menufy.com
+ezcater.com
+goldbelly.com
+dominos.*
+pizzahut.*
+papajohns.*
+
+# Grocery and snack delivery
+instacart.com
+gopuff.com
+getir.com

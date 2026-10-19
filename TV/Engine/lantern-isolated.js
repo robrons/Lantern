@@ -661,9 +661,22 @@
       live: !Number.isFinite(video.duration),
       page: location.href,
       agent: navigator.userAgent,
+      captions: captionsOf(video),
     });
     video.pause();
     return true;
+  }
+
+  /// The captions on screen for this video, so Apple's player can keep showing them: the
+  /// track that's showing, or one a site's own player is drawing from (hidden, with a line up).
+  function captionsOf(video) {
+    const tracks = Array.from(video.textTracks || []).filter((t) => t.kind === 'subtitles' || t.kind === 'captions');
+    const track = tracks.find((t) => t.mode === 'showing')
+      || tracks.find((t) => t.mode === 'hidden' && t.activeCues && t.activeCues.length > 0);
+    if (!track) return null;
+    const element = Array.from(video.querySelectorAll('track')).find((el) => el.track === track);
+    const cues = Array.from(track.cues || []).slice(0, 5000).map((cue) => [cue.startTime, cue.endTime, cue.text || '']);
+    return { language: track.language || '', label: track.label || '', src: element ? element.src : '', cues };
   }
 
   /// Full screen for whatever is playing: Apple's player if possible, otherwise the page's

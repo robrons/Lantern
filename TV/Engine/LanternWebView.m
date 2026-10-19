@@ -193,8 +193,28 @@ static NSMapTable *LanternOwnersByEngine(void) {
         [self.owner bridgeLoadRequest:request];
         return;
     }
-    if (LanternGetBool(targetFrame, @"isMainFrame")) {
-        [self.owner bridgeApplySiteModeForURL:request.URL preferences:preferences];
+    BOOL isMainFrame = LanternGetBool(targetFrame, @"isMainFrame");
+    LanternWebView *owner = self.owner;
+    id<LanternWebViewDelegate> delegate = owner.delegate;
+    if (owner != nil && request.URL != nil) {
+        if ([delegate respondsToSelector:@selector(webView:shouldBlockURL:mainFrame:)]
+            && [delegate webView:owner shouldBlockURL:request.URL mainFrame:isMainFrame]) {
+            decisionHandler(0, preferences);
+            return;
+        }
+        NSURL *replacement = isMainFrame && [delegate respondsToSelector:@selector(webView:replacementForURL:)]
+            ? [delegate webView:owner replacementForURL:request.URL]
+            : nil;
+        if (replacement != nil) {
+            decisionHandler(0, preferences);
+            NSMutableURLRequest *replacementRequest = [request mutableCopy];
+            replacementRequest.URL = replacement;
+            [owner bridgeLoadRequest:replacementRequest];
+            return;
+        }
+    }
+    if (isMainFrame) {
+        [owner bridgeApplySiteModeForURL:request.URL preferences:preferences];
     }
     decisionHandler(1, preferences);
 }

@@ -28,6 +28,10 @@ NS_SWIFT_UI_ACTOR
 - (void)webView:(LanternWebView *)webView didOpenPopup:(LanternWebView *)popup;
 /// The page closed its own window (as sign-in windows do when they're finished).
 - (void)webViewDidClose:(LanternWebView *)webView;
+/// Asked before any page or frame loads, including redirects. Returning YES stops it.
+- (BOOL)webView:(LanternWebView *)webView shouldBlockURL:(NSURL *)url mainFrame:(BOOL)isMainFrame;
+/// Asked before a page loads; returning an address loads that instead (used for SafeSearch).
+- (nullable NSURL *)webView:(LanternWebView *)webView replacementForURL:(NSURL *)url;
 @end
 
 /// Hosts Safari's web engine, which ships on tvOS but is not part of the public SDK.

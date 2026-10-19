@@ -684,7 +684,8 @@ final class BrowserViewController: UIViewController {
             startTime: body["time"] as? Double ?? 0,
             isLive: body["live"] as? Bool == true,
             pageURL: (body["page"] as? String).flatMap(URL.init(string:)),
-            userAgent: body["agent"] as? String
+            userAgent: body["agent"] as? String,
+            captions: (body["captions"] as? [String: Any]).map(NativePlayerViewController.Captions.init)
         )
         web.fetchCookies { [weak self] cookies in
             guard let self, self.presentedViewController == nil else { return }
@@ -1374,6 +1375,32 @@ extension BrowserViewController {
                 words, pieces: command["pieces"] as? Int ?? 1, quietly: command["quietly"] != nil)
             return reply(presentedViewController is TextEntryViewController ? "dictated" : "no keyboard open")
         }
+        if command["captions"] != nil {
+            return reply((presentedViewController as? NativePlayerViewController)?.captionStatus ?? "no player open")
+        }
+        if command["playerStats"] != nil {
+            let player = presentedViewController as? NativePlayerViewController
+            let stats = player?.customInfoViewControllers.first as? PlaybackStatsViewController
+            if let stats, command["playerStats"] as? String == "pin" {
+                stats.togglePin()
+                return reply("overlay: " + (stats.overlay.isHidden ? "hidden" : stats.overlay.text))
+            }
+            if let stats, command["playerStats"] as? String == "image" {
+                // Draw the tab as the panel shows it, to check the layout.
+                stats.loadViewIfNeeded()
+                stats.view.frame = CGRect(x: 0, y: 0, width: view.bounds.width, height: stats.preferredContentSize.height)
+                stats.view.backgroundColor = .darkGray
+                _ = stats.debugText()
+                stats.view.layoutIfNeeded()
+                let image = UIGraphicsImageRenderer(bounds: stats.view.bounds).image { context in
+                    stats.view.layer.render(in: context.cgContext)
+                }
+                let file = FileManager.default.temporaryDirectory.appendingPathComponent("stats.png")
+                try? image.pngData()?.write(to: file)
+                return reply(file.path)
+            }
+            return reply(stats?.debugText() ?? "no player open")
+        }
         if let letter = command["keypress"] as? String {
             (presentedViewController as? TextEntryViewController)?.simulateKeyPress(letter)
             return reply("typed \(letter)")
@@ -1428,6 +1455,15 @@ extension BrowserViewController: LanternWebViewDelegate {
             if inTheater { setTheater(false) }
             onPageChange?(currentSite)
             publishTabs()
+            // Sites like ChatGPT, LinkedIn and YouTube change pages without loading a new one, so
+            // there's no finished load to record. Save the page once its title has caught up.
+            if !loading, let url = webView.url, ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak webView] in
+                    guard let self, let webView, webView === self.web, webView.url == url else { return }
+                    self.library.recordVisit(url: url, title: webView.title ?? "", iconURL: nil)
+                    self.onPageChange?(self.currentSite)
+                }
+            }
         }
         if toolbarVisible {
             toolbarModel.canGoBack = webView.canGoBack
@@ -1438,6 +1474,8 @@ extension BrowserViewController: LanternWebViewDelegate {
 
     func webView(_ webView: LanternWebView, didFinishLoading url: URL?) {
         guard webView === web, let url else { return }
+        // Lantern's own notices (like a blocked site's) aren't pages to remember.
+        guard ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return }
         // A tab that was unloaded comes back where you were.
         if let tab = currentTab, tab.restoreScrollOnLoad {
             tab.restoreScrollOnLoad = false
@@ -1497,6 +1535,24 @@ extension BrowserViewController: LanternWebViewDelegate {
 
     func webView(_ webView: LanternWebView, shouldOpenPopupFor url: URL) -> Bool {
         webView === web && popup == nil && PopupPolicy.allows(url, openedFrom: webView.url)
+    }
+
+    func webView(_ webView: LanternWebView, shouldBlockURL url: URL, mainFrame isMainFrame: Bool) -> Bool {
+        guard let category = SiteBlocklist.category(of: url) else { return false }
+        guard isMainFrame else { return true }
+        // A typed address already shows as the page's address, so nothing worth staying on is
+        // left; say why the page is empty. A link from another page just stays put.
+        let nothingToShow = webView.url.map { SiteBlocklist.category(of: $0) != nil } ?? true
+        if nothingToShow, let notice = SiteBlocklist.noticePage(for: category) {
+            DispatchQueue.main.async { webView.loadURL(notice) }
+        } else {
+            toast.show(category.notice, for: 4)
+        }
+        return true
+    }
+
+    func webView(_ webView: LanternWebView, replacementFor url: URL) -> URL? {
+        SiteBlocklist.safeSearchURL(for: url)
     }
 
     func webView(_ webView: LanternWebView, didOpenPopup newPopup: LanternWebView) {
