@@ -47,7 +47,7 @@ final class RemoteHintView: UIView {
     private var hideWork: DispatchWorkItem?
 
     private static let rows: [(String, String)] = [
-        ("hand.point.up.left", "Swipe to move the pointer. Push it past the top or bottom edge to scroll."),
+        ("hand.point.up.left", "Swipe to move the pointer. Flick up or down to scroll, as on an iPhone."),
         ("hand.tap", "Click to select. Hold the click to open the menu with the address bar."),
         ("plus.magnifyingglass", "Zoom in or out from the menu. Each site remembers its zoom."),
         ("chevron.up.chevron.down", "Click the top or bottom of the clickpad to scroll a little at a time."),

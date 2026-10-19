@@ -64,6 +64,17 @@ final class BrowserViewController: UIViewController {
     private var scrollsInnerBox = false
     private var scriptScrollInFlight = false
     private var pendingScriptScroll = CGPoint.zero
+    /// Scrolling glides, like a Mac's: each click, flick or push adds speed, and the page slows
+    /// to a stop by itself. Speed falls by e^-glideRate a second, so a glide covers
+    /// speed / glideRate points. The page script uses the same rate for boxes inside the page.
+    private static let glideRate: CGFloat = 4.5
+    private static let maxGlideSpeed: CGFloat = 6000
+    private var glideVelocity = CGPoint.zero
+    /// The exact position, since the scroll view rounds what it's given to whole pixels.
+    private var glidePosition = CGPoint.zero
+    private var glideLink: CADisplayLink?
+    private weak var glideScrollView: UIScrollView?
+    private var glideLastStep: CFTimeInterval = 0
 
     // Keeping the page from being swamped
     /// Page script calls still waiting for an answer, with when each was sent.
@@ -96,15 +107,21 @@ final class BrowserViewController: UIViewController {
     private var longPressFired = false
 
     private static let hintCountKey = "remoteHintShown"
-    private static let pointerSpeedKey = "pointerSpeedSetting"
-    private static let pointerSpeeds: [(name: String, value: CGFloat)] = [("Slow", 0.6), ("Normal", 1), ("Fast", 1.6)]
-    private var pointerSpeed: CGFloat {
+    private static let pointerSpeedKey = "pointerSpeedLevel"
+    private static let pointerSpeeds: [(name: String, value: CGFloat)] = [("Slow", 1), ("Normal", 1.6), ("Fast", 2.3)]
+    /// How fast the pointer moves, by name. Flicks scale with it too: Fast flicks further.
+    private var pointerSpeedName: String {
         get {
-            let stored = UserDefaults.standard.double(forKey: Self.pointerSpeedKey)
-            return stored > 0 ? stored : 1
+            let stored = UserDefaults.standard.string(forKey: Self.pointerSpeedKey) ?? ""
+            return Self.pointerSpeeds.contains { $0.name == stored } ? stored : "Normal"
         }
-        set { UserDefaults.standard.set(Double(newValue), forKey: Self.pointerSpeedKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.pointerSpeedKey) }
     }
+    private var pointerSpeed: CGFloat {
+        Self.pointerSpeeds.first { $0.name == pointerSpeedName }?.value ?? 1.6
+    }
+    /// Flick distance relative to Normal.
+    private var flickScale: CGFloat { pointerSpeed / 1.6 }
     /// What "100%" means underneath. Pages lay out to the TV's full width, where text is as
     /// small as on a computer screen; 1.5x makes 100% comfortable from the couch.
     static let baseZoom: CGFloat = 1.5
@@ -558,6 +575,7 @@ final class BrowserViewController: UIViewController {
         hoverAgain = false
         scriptScrollInFlight = false
         pendingScriptScroll = .zero
+        stopGlide()
     }
 
     // MARK: Remote buttons
@@ -716,9 +734,9 @@ final class BrowserViewController: UIViewController {
         case .downArrow:
             if !inTheater { pageScroll(1) }
         case .leftArrow:
-            if inTheater { run(PageScripts.call("media", "seek", -10.0)) } else { scroll(dx: -view.bounds.width * 0.25, dy: 0, smooth: true) }
+            if inTheater { run(PageScripts.call("media", "seek", -10.0)) } else { glide(dx: -view.bounds.width * 0.25, dy: 0) }
         case .rightArrow:
-            if inTheater { run(PageScripts.call("media", "seek", 10.0)) } else { scroll(dx: view.bounds.width * 0.25, dy: 0, smooth: true) }
+            if inTheater { run(PageScripts.call("media", "seek", 10.0)) } else { glide(dx: view.bounds.width * 0.25, dy: 0) }
         default:
             break
         }
@@ -765,7 +783,7 @@ final class BrowserViewController: UIViewController {
     private func pageScroll(_ direction: Int) {
         checkScroller { [weak self] in
             guard let self else { return }
-            self.scroll(dx: 0, dy: CGFloat(direction) * self.view.bounds.height * 0.25, smooth: true)
+            self.glide(dx: 0, dy: CGFloat(direction) * self.view.bounds.height * 0.25)
         }
     }
 
@@ -779,49 +797,121 @@ final class BrowserViewController: UIViewController {
         }
     }
 
-    private func scroll(dx: CGFloat, dy: CGFloat, smooth: Bool) {
-        if !scrollsInnerBox, scrollPageNatively(dx: dx, dy: dy, animated: smooth) { return }
-        scrollWithScript(dx: dx, dy: dy, smooth: smooth)
+    /// Adds a glide of about `dx`, `dy` points to the page, or to the box under the pointer.
+    private func glide(dx: CGFloat, dy: CGFloat) {
+        if !scrollsInnerBox, glideNatively(dx: dx, dy: dy) { return }
+        glideWithScript(dx: dx, dy: dy)
     }
 
-    /// Scrolls the whole page with Apple's own scrolling: smooth, and no round trip to the page.
-    /// Returns false when the page itself doesn't scroll (some sites scroll a box instead).
-    private func scrollPageNatively(dx: CGFloat, dy: CGFloat, animated: Bool) -> Bool {
+    /// Glides the whole page with Apple's own scrolling: no round trip to the page. Returns
+    /// false when the page itself doesn't scroll that way (some sites scroll a box instead).
+    private func glideNatively(dx: CGFloat, dy: CGFloat) -> Bool {
         guard let scrollView = activeWeb?.scrollView else { return false }
         let size = scrollView.contentSize
         let bounds = scrollView.bounds.size
         let scrollsVertically = size.height > bounds.height + 1
         let scrollsHorizontally = size.width > bounds.width + 1
         guard (dy != 0 && scrollsVertically) || (dx != 0 && scrollsHorizontally) else { return false }
-        let current = scrollView.contentOffset
-        let target = CGPoint(
-            x: min(max(current.x + dx, 0), max(0, size.width - bounds.width)),
-            y: min(max(current.y + dy, 0), max(0, size.height - bounds.height))
-        )
-        if target != current {
-            scrollView.setContentOffset(target, animated: animated)
+
+        if glideLink == nil || glideScrollView !== scrollView {
+            stopGlide()
+            // The outline would hop from link to link as the page moves under the pointer; it
+            // comes back when the page stops.
+            hideTargetOutline()
+            glideScrollView = scrollView
+            glidePosition = scrollView.contentOffset
+            glideLastStep = CACurrentMediaTime()
+            let link = CADisplayLink(target: self, selector: #selector(stepGlide))
+            link.add(to: .main, forMode: .common)
+            glideLink = link
         }
-        // What's under the pointer has moved.
-        scheduleHover(after: animated ? 0.4 : 0.12)
+        // Going the other way stops the glide first, as on a Mac.
+        if glideVelocity.x * dx < 0 { glideVelocity.x = 0 }
+        if glideVelocity.y * dy < 0 { glideVelocity.y = 0 }
+        let limit = Self.maxGlideSpeed
+        glideVelocity.x = min(max(glideVelocity.x + dx * Self.glideRate, -limit), limit)
+        glideVelocity.y = min(max(glideVelocity.y + dy * Self.glideRate, -limit), limit)
         return true
     }
 
-    /// Scrolls a box inside the page through the page script. Requests are combined while one
-    /// is on its way, so a busy page gets one scroll instead of a backlog of them.
-    private func scrollWithScript(dx: CGFloat, dy: CGFloat, smooth: Bool) {
+    /// Moves the page one screen refresh along its glide, slowing it down; past either end, a
+    /// spring pulls it back for a soft bounce.
+    @objc private func stepGlide() {
+        guard let scrollView = glideScrollView, scrollView === activeWeb?.scrollView else {
+            stopGlide()
+            return
+        }
+        let now = CACurrentMediaTime()
+        let dt = CGFloat(min(now - glideLastStep, 1.0 / 20))
+        glideLastStep = now
+        // If the page moved itself (or was scrolled elsewhere), carry on from where it is.
+        let shown = scrollView.contentOffset
+        if abs(shown.x - glidePosition.x) > 2 || abs(shown.y - glidePosition.y) > 2 {
+            glidePosition = shown
+        }
+        let maximum = CGPoint(
+            x: max(0, scrollView.contentSize.width - scrollView.bounds.width),
+            y: max(0, scrollView.contentSize.height - scrollView.bounds.height)
+        )
+        let decay = exp(-Self.glideRate * dt)
+        func advance(_ position: inout CGFloat, _ velocity: inout CGFloat, upTo limit: CGFloat) -> Bool {
+            let beyond = position < 0 ? position : (position > limit ? position - limit : 0)
+            if beyond != 0 {
+                // A critically damped spring: it eases back without wobbling.
+                velocity += (-180 * beyond - 26.8 * velocity) * dt
+            } else {
+                velocity *= decay
+            }
+            position += velocity * dt
+            let after = position < 0 ? position : (position > limit ? position - limit : 0)
+            if abs(velocity) < 6 && abs(after) < 0.5 {
+                velocity = 0
+                position = min(max(position, 0), limit)
+                return false
+            }
+            return true
+        }
+        let movingX = advance(&glidePosition.x, &glideVelocity.x, upTo: maximum.x)
+        let movingY = advance(&glidePosition.y, &glideVelocity.y, upTo: maximum.y)
+        scrollView.setContentOffset(glidePosition, animated: false)
+        if !movingX && !movingY {
+            stopGlide()
+            // What's under the pointer has changed.
+            scheduleHover(after: 0.1)
+        }
+    }
+
+    private func stopGlide() {
+        glideLink?.invalidate()
+        glideLink = nil
+        glideVelocity = .zero
+        glideScrollView = nil
+    }
+
+    /// Slows a glide quickly, for when you start aiming the pointer.
+    private func brakeGlide() {
+        glideVelocity.x *= 0.7
+        glideVelocity.y *= 0.7
+    }
+
+    /// Glides a box inside the page; the page script runs the same glide itself. Requests are
+    /// combined while one is on its way, so a busy page gets one push instead of a backlog.
+    private func glideWithScript(dx: CGFloat, dy: CGFloat) {
         pendingScriptScroll.x += dx
         pendingScriptScroll.y += dy
         guard !scriptScrollInFlight, pendingScriptScroll != .zero, pageIsResponsive() else { return }
         let amount = pendingScriptScroll
         pendingScriptScroll = .zero
         scriptScrollInFlight = true
+        hideTargetOutline()
         let target = pagePoint(pointerPosition)
-        run(PageScripts.call("scroll", target.x, target.y, amount.x, amount.y, pageWidth, smooth)) { [weak self] _ in
+        run(PageScripts.call("glide", target.x, target.y, amount.x, amount.y, pageWidth)) { [weak self] _ in
             guard let self else { return }
             self.scriptScrollInFlight = false
-            self.scheduleHover(after: smooth ? 0.45 : 0.1)
+            // The box glides for about a second; look at what's under the pointer after.
+            self.scheduleHover(after: 1.0)
             if self.pendingScriptScroll != .zero {
-                self.scrollWithScript(dx: 0, dy: 0, smooth: smooth)
+                self.glideWithScript(dx: 0, dy: 0)
             }
         }
     }
@@ -850,6 +940,12 @@ final class BrowserViewController: UIViewController {
             let gain = (0.17 + min(swipeSpeed / 9000, 0.13)) * pointerSpeed
             pendingMove.x += delta.x * gain
             pendingMove.y += delta.y * gain
+            // A fast up-or-down swipe is probably a flick to scroll: hold the pointer still for
+            // its first moment so it doesn't dart off. Anything slower moves it straight away.
+            if let start = panStart, now - start.time < 0.15,
+               abs(velocity.y) > 2000, abs(velocity.y) > abs(velocity.x) * 2 {
+                return
+            }
             // Ignore sub-point twitches from a resting thumb; they still count once they add up.
             if hypot(pendingMove.x, pendingMove.y) >= 1 {
                 movePointer(by: pendingMove)
@@ -858,12 +954,17 @@ final class BrowserViewController: UIViewController {
         case .ended, .cancelled:
             let velocity = gesture.velocity(in: view)
             if let start = panStart, now - start.time < 0.2, abs(velocity.y) > 3200, abs(velocity.y) > abs(velocity.x) * 2.5 {
-                // A quick, deliberate flick scrolls the page instead of moving the pointer, by at
-                // most about a quarter of a screen so you don't lose your place.
-                setPointer(start.point)
-                let reach = view.bounds.height * 0.25
-                scroll(dx: 0, dy: max(-reach, min(reach, velocity.y * 0.08)), smooth: true)
-                hideTargetOutline()
+                // A quick, deliberate flick glides the page instead of moving the pointer. The
+                // page follows the thumb, as on an iPhone: flick up to move further down the
+                // page. At Normal speed each flick goes up to about 70% of a screen, more at
+                // Fast and less at Slow; flicking again adds to it.
+                pendingMove = .zero
+                let reach = view.bounds.height * 0.7 * flickScale
+                glide(dx: 0, dy: max(-reach, min(reach, -velocity.y * 0.16 * flickScale)))
+            } else if pendingMove != .zero {
+                // A short swipe that wasn't a flick: make the move that was held back.
+                movePointer(by: pendingMove)
+                pendingMove = .zero
             }
             panStart = nil
             scheduleHide()
@@ -891,9 +992,14 @@ final class BrowserViewController: UIViewController {
             point.y = bounds.maxY
         }
         setPointer(point)
-        // Pushing past an edge scrolls the page that way.
-        if overflow != .zero && !inTheater {
-            scroll(dx: overflow.x * 1.2, dy: overflow.y * 1.2, smooth: false)
+        // Pushing past the left or right edge glides the page sideways, speeding up as you keep
+        // pushing. The top and bottom edges just stop the pointer: flicks scroll up and down,
+        // following the thumb, and pushing the other way at those edges would fight them.
+        // Moving the pointer anywhere else slows a glide to a stop so you can aim.
+        if overflow.x != 0 && !inTheater {
+            glide(dx: overflow.x * 1.6, dy: 0)
+        } else if let start = panStart, CACurrentMediaTime() - start.time > 0.2 {
+            brakeGlide()
         }
         scheduleHover()
     }
@@ -1059,7 +1165,7 @@ final class BrowserViewController: UIViewController {
         toolbarModel.isFavorite = web.url.map(library.isFavorite) ?? false
         toolbarModel.isMobileSite = web.url.map(library.prefersMobileSite) ?? false
         toolbarModel.zoomText = "\(Int((zoom * 100).rounded()))%"
-        toolbarModel.pointerSpeedName = Self.pointerSpeeds.first { $0.value == pointerSpeed }?.name ?? "Normal"
+        toolbarModel.pointerSpeedName = pointerSpeedName
     }
 
     private func perform(_ action: ToolbarAction) {
@@ -1108,8 +1214,8 @@ final class BrowserViewController: UIViewController {
             setMobileSite(!library.prefersMobileSite(url), for: url)
         case .pointerSpeed:
             let speeds = Self.pointerSpeeds
-            let index = speeds.firstIndex { $0.value == pointerSpeed } ?? 1
-            pointerSpeed = speeds[(index + 1) % speeds.count].value
+            let index = speeds.firstIndex { $0.name == pointerSpeedName } ?? 1
+            pointerSpeedName = speeds[(index + 1) % speeds.count].name
             refreshToolbar()
         case .zoomIn, .zoomOut:
             let step: CGFloat = action.isZoomIn ? 0.1 : -0.1

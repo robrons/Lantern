@@ -26,7 +26,8 @@ tvOS ships Safari's web engine but doesn't let apps use it. Lantern loads it any
 
 | Remote | What it does |
 | --- | --- |
-| Swipe | Move the pointer; push past the top or bottom edge to scroll |
+| Swipe | Move the pointer |
+| Flick up or down | Scroll; the page follows your thumb, as on an iPhone, and glides to a stop |
 | Click | Select what's outlined |
 | Hold the click | Open the menu: tabs, address bar, back/forward, favorite, full screen, site version, zoom, pointer speed |
 | Click the top or bottom of the clickpad | Scroll a quarter of a screen |

@@ -737,6 +737,75 @@
     return 'page';
   }
 
+  // Gliding, to match Lantern's native scrolling for boxes inside the page: each request adds
+  // speed, and the box slows to a stop by itself, one animation frame at a time.
+  const GLIDE_RATE = 4.5;
+  let glide = null;
+
+  function glideAt(x, y, dx, dy, maxSpeed) {
+    const root = document.scrollingElement || document.documentElement;
+    let target = root;
+    for (let e = elementAt(x, y); e && e.nodeType === 1 && e !== document.documentElement; e = parentOf(e)) {
+      if (e === document.body && document.scrollingElement === document.documentElement) break;
+      if (canScroll(e, dx, dy)) {
+        target = e;
+        break;
+      }
+    }
+    if (!glide || glide.el !== target) {
+      glide = { el: target, vx: 0, vy: 0, x: target.scrollLeft, y: target.scrollTop, last: 0, running: false };
+    }
+    // Going the other way stops the glide first.
+    if (glide.vx * dx < 0) glide.vx = 0;
+    if (glide.vy * dy < 0) glide.vy = 0;
+    glide.vx = Math.max(-maxSpeed, Math.min(maxSpeed, glide.vx + dx * GLIDE_RATE));
+    glide.vy = Math.max(-maxSpeed, Math.min(maxSpeed, glide.vy + dy * GLIDE_RATE));
+    if (!glide.running) {
+      glide.running = true;
+      glide.x = target.scrollLeft;
+      glide.y = target.scrollTop;
+      glide.last = performance.now();
+      requestAnimationFrame(stepGlide);
+    }
+    return target === root ? 'page' : 'inner';
+  }
+
+  function stepGlide(now) {
+    const g = glide;
+    if (!g || !g.el.isConnected) {
+      glide = null;
+      return;
+    }
+    const dt = Math.max(0, Math.min(0.05, (now - g.last) / 1000));
+    g.last = now;
+    // If the box moved by itself, carry on from where it is.
+    if (Math.abs(g.el.scrollTop - g.y) > 2) g.y = g.el.scrollTop;
+    if (Math.abs(g.el.scrollLeft - g.x) > 2) g.x = g.el.scrollLeft;
+    const maxX = Math.max(0, g.el.scrollWidth - g.el.clientWidth);
+    const maxY = Math.max(0, g.el.scrollHeight - g.el.clientHeight);
+    g.x += g.vx * dt;
+    g.y += g.vy * dt;
+    // Reaching an end stops the glide that way.
+    if ((g.x <= 0 && g.vx < 0) || (g.x >= maxX && g.vx > 0)) g.vx = 0;
+    if ((g.y <= 0 && g.vy < 0) || (g.y >= maxY && g.vy > 0)) g.vy = 0;
+    g.x = Math.max(0, Math.min(maxX, g.x));
+    g.y = Math.max(0, Math.min(maxY, g.y));
+    const decay = Math.exp(-GLIDE_RATE * dt);
+    g.vx *= decay;
+    g.vy *= decay;
+    try {
+      g.el.scrollTo({ left: g.x, top: g.y, behavior: 'instant' });
+    } catch {
+      g.el.scrollLeft = g.x;
+      g.el.scrollTop = g.y;
+    }
+    if (Math.hypot(g.vx, g.vy) < 6) {
+      g.running = false;
+      return;
+    }
+    requestAnimationFrame(stepGlide);
+  }
+
   // ---- Page details for the library ----
 
   function bestIcon() {
@@ -803,6 +872,10 @@
         return scrollAt(x * s, y * s, dx * s, dy * s, smooth);
       },
       scroller: (x, y, vw) => { const s = scale(vw); return scrollerAt(x * s, y * s); },
+      glide: (x, y, dx, dy, vw) => {
+        const s = scale(vw);
+        return glideAt(x * s, y * s, dx * s, dy * s, 6000 * s);
+      },
       page: (x, y, direction, vw) => {
         const s = scale(vw);
         return scrollAt(x * s, y * s, 0, direction * innerHeight * 0.8, true);
