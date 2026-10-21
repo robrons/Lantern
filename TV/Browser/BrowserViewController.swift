@@ -371,7 +371,7 @@ final class BrowserViewController: UIViewController {
 
     private func startNewTab() {
         guard tabs.count < Self.maxTabs else {
-            toast.show("Lantern keeps up to \(Self.maxTabs) tabs. Close one first.", for: 3)
+            toast.show("You can have up to \(Self.maxTabs) tabs. Close one first.", for: 3)
             return
         }
         openNextInNewTab = true
@@ -482,7 +482,7 @@ final class BrowserViewController: UIViewController {
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
             guard let self, !answered, let web = self.web, self.afterFrozenPageStops == nil else { return }
             self.afterFrozenPageStops = afterStopping ?? action
-            self.toast.show("This page froze, so Lantern closed it.", for: 4)
+            self.toast.show("This page froze, so it was closed.", for: 4)
             web.stopFrozenPage()
         }
     }
@@ -1272,7 +1272,7 @@ final class BrowserViewController: UIViewController {
         case "verification":
             if let page = currentPageKey, verificationNoticePage != page {
                 verificationNoticePage = page
-                toast.show("Lantern can\u{2019}t click \u{201C}verify you\u{2019}re human\u{201D} checks; they need a real touch. Some pass on their own after a few seconds. Press Back to leave the page.", for: 8)
+                toast.show("Clicks can\u{2019}t pass \u{201C}verify you\u{2019}re human\u{201D} checks; they need a real touch. Some pass on their own after a few seconds. Press Back to leave the page.", for: 8)
             }
         case "popupBlocked":
             toast.show("Blocked a pop-up", for: 2)
@@ -1510,7 +1510,7 @@ extension BrowserViewController: LanternWebViewDelegate {
             unload(tab)
             return
         }
-        let reasons = [0: "too much memory", 1: "too much CPU", 2: "stopped by Lantern", 3: "crashed"]
+        let reasons = [0: "too much memory", 1: "too much CPU", 2: "stopped by the app", 3: "crashed"]
         let reason = reasons[webView.lastStopReason] ?? "no reason given"
         PageHealthLog.record("stopped", url: webView.url ?? currentTab?.url, detail: reason)
         resetPageWork()
@@ -1524,9 +1524,9 @@ extension BrowserViewController: LanternWebViewDelegate {
         defer { lastPageCrash = now }
         // Reload once; a page that crashes again right away is left alone instead of looping.
         if let last = lastPageCrash, now.timeIntervalSince(last) < 60 {
-            toast.show("This page keeps running out of memory, so Lantern stopped reloading it. Press Back to leave it, or close other apps on the TV to free memory.", for: 9)
+            toast.show("This page keeps running out of memory, so it won\u{2019}t be reloaded again. Press Back to leave it, or close other apps on the TV to free memory.", for: 9)
         } else {
-            toast.show(webView.lastStopReason == 3 ? "This page crashed, so Lantern reloaded it." : "This page ran out of memory, so Lantern reloaded it.", for: 4)
+            toast.show(webView.lastStopReason == 3 ? "This page crashed and was reloaded." : "This page ran out of memory and was reloaded.", for: 4)
             rememberScrollPosition()
             currentTab?.restoreScrollOnLoad = true
             webView.reload()

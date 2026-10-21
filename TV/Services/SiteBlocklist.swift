@@ -9,8 +9,8 @@ enum SiteBlocklist {
 
         var notice: String {
             switch self {
-            case .adult: "Lantern blocks adult sites."
-            case .foodDelivery: "Lantern blocks food delivery sites."
+            case .adult: "Adult sites are blocked."
+            case .foodDelivery: "Food delivery sites are blocked."
             }
         }
     }

@@ -175,7 +175,7 @@
 				DEVELOPMENT_TEAM = YY96UL254B;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "Config/TV-Info.plist";
-				INFOPLIST_KEY_CFBundleDisplayName = Lantern;
+				INFOPLIST_KEY_CFBundleDisplayName = Web;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -200,7 +200,7 @@
 				DEVELOPMENT_TEAM = YY96UL254B;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "Config/TV-Info.plist";
-				INFOPLIST_KEY_CFBundleDisplayName = Lantern;
+				INFOPLIST_KEY_CFBundleDisplayName = Web;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",

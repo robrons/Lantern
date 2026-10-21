@@ -79,7 +79,7 @@ struct HomeView: View {
             .onExitCommand(perform: leaveArmed ? nil : armLeave)
             .overlay(alignment: .bottom) {
                 if leaveArmed {
-                    Text("Press Back again to leave Lantern")
+                    Text("Press Back again to leave")
                         .font(.callout)
                         .padding(.horizontal, 36)
                         .padding(.vertical, 18)
@@ -103,13 +103,13 @@ struct HomeView: View {
     private var header: some View {
         HStack(spacing: 40) {
             Label {
-                Text("Lantern")
+                Text("Web")
             } icon: {
-                Image("LanternGlyph")
+                Image("AppGlyph")
                     .resizable()
                     .scaledToFit()
                     .frame(width: 52, height: 52)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.blue)
             }
             .font(.title2.bold())
             .labelStyle(.titleAndIcon)
